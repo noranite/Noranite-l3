@@ -1,0 +1,25 @@
+# macOS and Windows metadata
+.DS_Store
+Thumbs.db
+
+# IDEs and editors
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Go build and test output
+/.cache/
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+*.prof
