@@ -1,16 +1,18 @@
-## Установка и управление
+# Usage
 
-Серверный установщик рассчитан на Linux с systemd и `iptables`. Он устанавливает уже собранные бинарники из `./bin`, создаёт ключи и конфигурацию в `/etc/noranite`, настраивает `nrnt0`, forwarding/NAT и запускает сервис.
+## Installation and administration
 
-Для Debian/Ubuntu сервер можно установить одной командой:
+The server installer targets Linux systems using systemd and `iptables`. It installs prebuilt binaries from `./bin`, creates keys and configuration under `/etc/noranite`, configures `nrnt0`, forwarding/NAT, and starts the service.
+
+On Debian/Ubuntu, the server can be installed with a single command:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/noranite/Noranite-l3/main/quick-install | sudo bash
 ```
 
-Quick installer скачивает исходники с GitHub во временный каталог, при необходимости использует временный Go toolchain нужной версии, собирает серверные бинарники и запускает штатный installer. При первой установке он автоматически определит Internet-facing interface и попросит выбрать tunnel address, UDP port, MTU (рекомендуется не более 1380) и режим доступа к локальной сети. При повторном запуске существующие `/etc/noranite/server.env`, ключи и peers сохраняются.
+The quick installer downloads the source from GitHub into a temporary directory, uses a temporary Go toolchain of the required version when necessary, builds the server binaries, and runs the standard installer. On first install it automatically detects the Internet-facing interface and asks for the tunnel address, UDP port, MTU (1380 or lower is recommended), and local-network access mode. On subsequent runs, existing `/etc/noranite/server.env`, keys, and peers are preserved.
 
-Ручной вариант начинается со сборки необходимых бинарников из корня репозитория:
+For a manual installation, first build the required binaries from the repository root:
 
 ```bash
 mkdir -p bin
@@ -20,13 +22,13 @@ go build -o bin/noranite-peer ./cmd/noranite-peer
 go build -o bin/opaque-keygen ./cmd/opaque-keygen
 ```
 
-Базовая установка:
+Basic installation:
 
 ```bash
 sudo ./install/server/install.sh
 ```
 
-По умолчанию используется tunnel `10.66.0.1/16`, UDP `0.0.0.0:41675`, MTU `1380`, а Internet-facing interface определяется по default route. При первой установке основные параметры можно задать явно:
+The defaults are tunnel `10.66.0.1/16`, UDP bind `0.0.0.0:41675`, and MTU `1380`; the Internet-facing interface is detected from the default route. On first install, the main parameters can be specified explicitly:
 
 ```bash
 sudo ./install/server/install.sh \
@@ -37,9 +39,9 @@ sudo ./install/server/install.sh \
   --local-access deny
 ```
 
-`--local-access deny` используется по умолчанию: VPN peers получают Internet egress, но не доступ к самому VPN-серверу и локальным сетям. `--local-access allow` снимает эту дополнительную изоляцию; дальнейший доступ определяется routing/firewall самого хоста.
+`--local-access deny` is the default: VPN peers receive Internet egress but cannot access the VPN server itself or local networks. `--local-access allow` removes this additional isolation; further access is then controlled by the host's own routing and firewall configuration.
 
-После установки основные файлы находятся в `/etc/noranite`:
+After installation, the main files live under `/etc/noranite`:
 
 ```text
 server.env       network/runtime parameters
@@ -50,7 +52,7 @@ server.public    server X25519 public key
 server.peers     persistent bootstrap peers
 ```
 
-Состояние сервиса:
+Service status and logs:
 
 ```bash
 sudo systemctl status noranite-server
@@ -58,31 +60,31 @@ sudo systemctl restart noranite-server
 sudo journalctl -u noranite-server -f
 ```
 
-Полное удаление сервера, включая ключи, persistent peers, systemd units, firewall rules и установленные бинарники:
+To completely remove the server, including keys, persistent peers, systemd units, firewall rules, and installed binaries:
 
 ```bash
 sudo ./uninstall
 ```
 
-`uninstall` просит явное подтверждение перед удалением `/etc/noranite`. Для автоматического запуска используется `sudo ./uninstall --yes`. Пакеты ОС, которые могли существовать до Noranite или использоваться другими программами, uninstall не удаляет.
+`uninstall` asks for explicit confirmation before removing `/etc/noranite`. For non-interactive use, run `sudo ./uninstall --yes`. It does not remove OS packages that may have existed before Noranite or may be used by other software.
 
-### Пиры
+### Peers
 
-`/etc/noranite/server.peers` загружается при каждом старте процесса. Формат строки:
+`/etc/noranite/server.peers` is loaded on every process start. Each line has the following format:
 
 ```text
 <tunnel-ipv4> <client-public-key> [name]
 ```
 
-Например:
+For example:
 
 ```text
 10.66.0.2 BASE64_KEY alice
 ```
 
-Пиры из файла при старте проходят через тот же runtime Controller, что и динамические операции. Если файл некорректен или содержит конфликтующие IP/ключи, сервер не стартует.
+Peers loaded from the file go through the same runtime Controller used by dynamic operations. If the file is invalid or contains conflicting IPs or keys, the server refuses to start.
 
-Для управления уже запущенным сервером используется локальный Unix socket `/run/noranite/control.sock` с mode `0600`. Удалённого management API нет; для удалённого администрирования достаточно SSH и `sudo noranitectl`:
+A running server is managed through the local Unix socket `/run/noranite/control.sock`, created with mode `0600`. There is no remote management API; SSH plus `sudo noranitectl` is sufficient for remote administration:
 
 ```bash
 sudo noranitectl peer list
@@ -90,9 +92,9 @@ sudo noranitectl peer set --ip 10.66.0.2 --public-key BASE64_KEY
 sudo noranitectl peer remove --public-key BASE64_KEY
 ```
 
-`peer set` идемпотентен. Повтор той же пары ничего не меняет; тот же public key с другим IP заменяет runtime peer и сбрасывает его активные sessions. IP, уже занятый другим public key, использовать нельзя.
+`peer set` is idempotent. Repeating the same pair changes nothing; setting the same public key with a different IP replaces the runtime peer and drops its active sessions. An IP already assigned to another public key cannot be reused.
 
-Для обычного добавления нового клиента есть provisioning tool: он генерирует client X25519 keypair, выбирает первый свободный адрес в настроенном `/16` и добавляет peer в runtime:
+For normal client provisioning, `noranite-peer` generates a client X25519 keypair, selects the first free address in the configured `/16`, and adds the peer to the runtime:
 
 ```bash
 sudo noranite-peer add \
@@ -101,22 +103,21 @@ sudo noranite-peer add \
   --public-key-out ./alice.pub
 ```
 
-Runtime-команды не изменяют `server.peers`. Поэтому после рестарта сервер снова поднимет набор peers из этого файла; persistence/autosync, если он нужен, остаётся отдельным уровнем над runtime control plane.
+Runtime commands do not modify `server.peers`. After a restart, the server therefore restores the peer set from that file. Persistence or autosync, if required, remains a separate layer above the runtime control plane.
 
+## Client based on sing-box
 
-## Клиент на базе sing-box
+To use Noranite as an endpoint in a full TUN/proxy client, build sing-box with the Noranite reference integration.
 
-Для использования Noranite в качестве endpoint в полноценном TUN/proxy-клиенте можно собрать sing-box с reference-интеграцией Noranite.
-
-Интеграция рассчитана на **sing-box v1.13.15** и поставляется в виде отдельного патча:
+The integration targets **sing-box v1.13.15** and is provided as a standalone patch:
 
 ```text
 integrations/sing-box/sing-box-1.13.15-noranite-integration.patch
 ```
 
-### Сборка
+### Build
 
-1. Склонируйте исходники sing-box и перейдите на версию `v1.13.15`:
+1. Clone the sing-box source and check out `v1.13.15`:
 
 ```bash
 git clone https://github.com/SagerNet/sing-box.git
@@ -124,13 +125,13 @@ cd sing-box
 git checkout v1.13.15
 ```
 
-2. Примените патч Noranite:
+2. Apply the Noranite patch:
 
 ```bash
 git apply /path/to/Noranite-l3/integrations/sing-box/sing-box-1.13.15-noranite-integration.patch
 ```
 
-3. Подключите локальный checkout Noranite-l3:
+3. Point the sing-box module at your local Noranite-l3 checkout:
 
 ```bash
 go mod edit \
@@ -140,30 +141,30 @@ go mod edit \
 go mod tidy
 ```
 
-4. Соберите sing-box штатным build-процессом, добавив build tag `with_noranite`.
+4. Build sing-box using its normal build process, adding the `with_noranite` build tag.
 
-Для Linux/macOS:
+On Linux/macOS:
 
 ```bash
 TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS),with_noranite"
 make build TAGS="$TAGS"
 ```
 
-Для Windows необходимо использовать набор тегов из:
+On Windows, use the build-tag set from:
 
 ```text
 release/DEFAULT_BUILD_TAGS_WINDOWS
 ```
 
-и также добавить:
+and add:
 
 ```text
 with_noranite
 ```
 
-Интеграция требует `with_gvisor`; этот тег уже входит в стандартные наборы build tags sing-box v1.13.15.
+The integration requires `with_gvisor`; that tag is already included in the standard sing-box v1.13.15 build-tag sets.
 
-После сборки в конфигурации становится доступен endpoint типа:
+After building, a `noranite` endpoint becomes available in the configuration:
 
 ```json
 {
@@ -179,6 +180,6 @@ with_noranite
 }
 ```
 
-Патч является reference-интеграцией Noranite с sing-box и не является отдельным дистрибутивом sing-box.
+The patch is a reference integration of Noranite with sing-box, not a separate sing-box distribution.
 
-sing-box распространяется его авторами отдельно и используется здесь как сторонняя платформа. Noranite не аффилирован с SagerNet и разработчиками sing-box.
+sing-box is distributed separately by its authors and is used here as a third-party platform. Noranite is not affiliated with SagerNet or the sing-box maintainers.

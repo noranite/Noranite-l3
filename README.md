@@ -1,16 +1,18 @@
 # Noranite
 
-Noranite — anticensorship L3-tunnel поверх UDP без узнаваемого wire format.
+[English](README.md) · [Русский](README.ru.md) · [Usage](USAGE.md)
 
-Протокол реализует философию отсутствия отпечатков протокола на уровне архитектуры. **Все пакеты, с первого и до последнего байта, выглядят как высокоэнтропийный бинарный шум.**
+Noranite is an anti-censorship L3 tunnel over UDP with no recognizable wire format.
 
-В нём нет открытых magic bytes, версии протокола, типа пакета, session ID, sequence number или узнаваемого handshake header.
+The protocol is designed around the absence of protocol fingerprints as an architectural property. **Every packet, from the first byte to the last, looks like high-entropy binary noise.**
 
-Noranite не маскируется под QUIC, DNS, HTTPS или другой разрешённый протокол. Он решает более простую задачу: **не иметь собственной фиксированной сигнатуры**, что делает блокировку протокола связанной с недопустимым коллатеральным уроном.
+There are no exposed magic bytes, protocol version, packet type, session ID, sequence number, or recognizable handshake header.
 
-## Основная идея
+Noranite does not disguise itself as QUIC, DNS, HTTPS, or another allowed protocol. It solves a simpler problem: **it has no fixed signature of its own**, so selectively blocking the protocol requires collateral damage that is difficult to keep acceptable.
 
-Обычный зашифрованный протокол часто выглядит примерно так:
+## Core idea
+
+A conventional encrypted protocol often looks roughly like this:
 
 ```text
 magic
@@ -22,9 +24,9 @@ counter
 encrypted payload
 ```
 
-Payload может быть идеально зашифрован, но открытый framing уже даёт DPI готовую сигнатуру.
+The payload may be perfectly encrypted, but the clear-text framing already gives DPI a ready-made signature.
 
-У Noranite такого заголовка нет.
+Noranite has no such header.
 
 ```text
 +-------------------+------------------------------+
@@ -33,114 +35,114 @@ Payload может быть идеально зашифрован, но откр
 +-------------------+------------------------------+
 ```
 
-Первые 16 байт содержат замаскированные данные, необходимые для поиска сессии и проверки sequence number. Сами значения на проводе не присутствуют.
+The first 16 bytes carry masked data required to locate the session and validate the sequence number. The actual values never appear on the wire.
 
-Остальная часть пакета также не содержит открытого типа сообщения или другой постоянной структуры.
+The rest of the packet likewise contains no exposed message type or other constant structure.
 
-DATA, служебные пакеты и handshake различаются только после криптографической обработки.
+DATA, control packets, and handshake traffic become distinguishable only after cryptographic processing.
 
-## Зачем вообще нужен "бинарный шум"
+## Why "binary noise" matters
 
-Смысл не в самих случайных байтах, а в том, что они лишают DPI дешёвой и точной сигнатуры. Если протокол как-то себя выдает, его можно блокировать почти без побочного ущерба. Если же packet payload неотличим от обычного encrypted UDP, остаётся либо дорогой behavioral analysis по timing, размерам и структуре flow, либо грубая блокировка широкого класса UDP-трафика вместе с HTTP/3/QUIC, WebRTC, real-time media, играми, VPN и собственными протоколами приложений.
+The point is not randomness for its own sake. The point is to deny DPI a cheap, precise signature. If a protocol identifies itself on the wire, it can be blocked with little collateral damage. If the packet payload is indistinguishable from ordinary encrypted UDP, the censor is left with either expensive behavioral analysis based on timing, sizes, and flow structure, or coarse blocking of a broad class of UDP traffic together with HTTP/3/QUIC, WebRTC, real-time media, games, VPNs, and application-specific protocols.
 
-Все, что мы даем стороннему наблюдателю - это картина "какой-то странный трафик". Но под это определение подходит большая часть UDP трафика интернета.
-Чем меньше протокол сообщает о себе на wire, тем больше вычислительной работы, false positives и collateral damage требуется цензору для его блокировки.
-Поведенческий анализ трафика все равно остается возможным, но Noranite - L3 tunnel, обеспечивающий мультиплексирование и размытие размеров пакетов, что значительно затрудняет даже такой анализ (USENIX Security 2024)
+All an outside observer gets is a picture of "some strange traffic". A large share of Internet UDP traffic fits that description.
+The less a protocol reveals about itself on the wire, the more computation, false positives, and collateral damage are required to block it.
+Behavioral traffic analysis is still possible, but Noranite is an L3 tunnel: multiplexing and packet-size blurring significantly complicate that class of analysis as well (USENIX Security 2024).
 
-Noranite не делает блокировку невозможной. Он делает её **грязной и очень дорогой**.
+Noranite does not make blocking impossible. It makes precise blocking **messy and very expensive**.
 
-## Что говорят исследования
+## What the research says
 
-Высокоэнтропийный трафик сам по себе не является нераспознаваемым: encrypted traffic можно классифицировать по размерам пакетов, timing и другим признакам потока.
+High-entropy traffic is not automatically unclassifiable: encrypted traffic can still be classified by packet sizes, timing, and other flow-level features.
 
-Наиболее известный исследованный механизм GFW для блокировки fully-encrypted traffic работал с TCP; случайный UDP этим механизмом не блокировался, что подтверждается исследованиями USENIX 2023, 2025.  Более новые работы показывают, что GFW умеет stateful-анализ UDP и QUIC, но об использовании произвольного анализа opaque-UDP в настоящее время не известно.
-Для selective blocking цензору приходится опираться на метаданные потока, репутацию IP, статистическую классификацию или более грубую политику фильтрации.
+The best-known studied GFW mechanism for blocking fully encrypted traffic operated on TCP; random UDP was not blocked by that mechanism, as reported in USENIX studies from 2023 and 2025. More recent work shows that the GFW can perform stateful analysis of UDP and QUIC, but there is currently no public evidence of arbitrary opaque-UDP analysis being used as a general blocking mechanism.
+For selective blocking, a censor therefore has to fall back to flow metadata, IP reputation, statistical classification, or broader filtering policy.
 
-## Криптография
+## Cryptography
 
-Сессия устанавливается через:
+A session is established with:
 
 ```text
 Noise_IK_25519_ChaChaPoly_BLAKE2s
 ```
 
-Noise IK даёт Noranite:
+Noise IK gives Noranite:
 
-- взаимную аутентификацию клиента и сервера;
-- статические X25519 identities;
-- forward secrecy через ephemeral X25519;
-- свежие независимые ключи для каждого нового соединения.
+- mutual authentication between client and server;
+- static X25519 identities;
+- forward secrecy through ephemeral X25519;
+- fresh, independent keys for every new connection.
 
-После handshake трафик защищается ChaCha20-Poly1305.
+After the handshake, traffic is protected with ChaCha20-Poly1305.
 
-Ключи передачи данных разделены по направлениям. Новый handshake создаёт новый независимый набор ключей.
+Traffic keys are separated by direction. A new handshake produces a new independent set of keys.
 
-Noise используется только для аутентификации и получения ключевого материала. Формат трафика Noranite остаётся отдельным.
+Noise is used only for authentication and key derivation. The Noranite wire format remains a separate layer.
 
 ## `K_route`
 
-Помимо Noise identities обе стороны используют общий 32-байтный секрет `K_route`.
+In addition to Noise identities, both sides share a 32-byte secret called `K_route`.
 
-Это не ключ шифрования трафика и не Noise PSK.
+It is not a traffic-encryption key and it is not a Noise PSK.
 
-`K_route` нужен для того, чтобы скрыть структуру пакета ещё **до** момента, когда получатель определил нужную сессию и получил возможность использовать её traffic key.
+`K_route` exists to hide packet structure **before** the receiver has identified the relevant session and can use its traffic key.
 
-С его помощью маскируются:
+It is used to mask:
 
-- `session_id || sequence` в первых 16 байтах пакета;
-- ephemeral X25519 public key внутри Noise handshake.
+- `session_id || sequence` in the first 16 bytes of a packet;
+- the ephemeral X25519 public key inside the Noise handshake.
 
-Mask привязан к конкретному пакету, поэтому одинаковые внутренние значения не дают одинакового представления на проводе.
+The mask is bound to the individual packet, so identical internal values do not produce identical bytes on the wire.
 
-Сам по себе `K_route` не позволяет расшифровать DATA и не раскрывает Noise private keys. Компрометация `K_route`  не ломает криптографическую защиту туннеля, но делает протокол открытым для DPI. Это осознанно: если цензор знает k_route - он знает IP. В этом случае анализ уже не требуется: намного дешевле блокировать IP.
+Knowing `K_route` alone does not allow an attacker to decrypt DATA or recover Noise private keys. Compromising `K_route` does not break the tunnel's cryptographic confidentiality or authentication, but it does expose the protocol to DPI. This is intentional: if a censor knows `K_route`, it already knows the endpoint IP. At that point traffic analysis is unnecessary; blocking the IP is cheaper.
 
 ## Handshake
 
-Обычный Noise IK оставляет ephemeral X25519 public key открытым. Это уже достаточно структурированное значение, чтобы использовать его как часть fingerprint.
+A standard Noise IK handshake exposes the ephemeral X25519 public key. That is already a sufficiently structured value to contribute to a fingerprint.
 
-Noranite дополнительно маскирует его через keyed BLAKE2s с `K_route`.
+Noranite additionally masks it with keyed BLAKE2s using `K_route`.
 
-Handshake также использует случайный padding и переменный размер пакетов.
+The handshake also uses random padding and variable packet sizes.
 
-В результате на проводе нет характерной структуры Noise IK:
+As a result, the recognizable Noise IK structure is absent from the wire:
 
 ```text
 opaque INIT  ->
              <-  opaque RESPONSE
 ```
 
-Статические identities аутентифицируются внутри Noise.
+Static identities are authenticated inside Noise.
 
-Сервер не публикует banner, protocol identifier или другую информацию, по которой его можно определить обычным UDP probe.
+The server exposes no banner, protocol identifier, or other information that can identify it through an ordinary UDP probe.
 
-Случайный UDP datagram не вызывает корректный protocol response.
+A random UDP datagram does not trigger a valid protocol response.
 
 ## DATA
 
-Один DATA packet переносит один IPv4 packet.
+One DATA packet carries one IPv4 packet.
 
-В открытом виде на проводе отсутствуют:
+The following values are never exposed in clear text on the wire:
 
-- тип DATA;
+- DATA packet type;
 - session ID;
 - sequence number;
 - inner source address;
 - inner destination address;
-- transport protocol внутреннего пакета.
+- transport protocol of the inner packet.
 
-Весь inner IPv4 packet находится внутри ChaCha20-Poly1305 ciphertext.
+The entire inner IPv4 packet is carried inside ChaCha20-Poly1305 ciphertext.
 
-К пакету добавляется случайный authenticated padding, поэтому одинаковые внутренние пакеты не обязаны иметь одинаковый внешний размер.
+Random authenticated padding is added to each packet, so identical inner packets do not have to produce identical outer sizes.
 
-DATA и служебный трафик используют один и тот же opaque envelope. Их тип находится внутри зашифрованной части.
+DATA and control traffic use the same opaque envelope. Their type exists only inside the encrypted portion.
 
 ## Replay protection
 
-Каждая сессия имеет собственный монотонный sequence number и отдельное replay window.
+Every session has its own monotonic sequence number and its own replay window.
 
-Sequence участвует в формировании AEAD nonce и никогда не используется повторно внутри одной сессии.
+The sequence number participates in AEAD nonce construction and is never reused within a session.
 
-Полученный пакет не может повлиять на состояние туннеля до успешной проверки:
+A received packet cannot affect tunnel state until it has successfully passed all checks:
 
 ```text
 route
@@ -154,34 +156,34 @@ replay protection
 accepted packet
 ```
 
-Подделка opaque route сама по себе ничего не даёт: настоящий session ID не является средством аутентификации.
+Forging an opaque route value is not useful by itself: the real session ID is not an authentication mechanism.
 
-## Почему этому можно доверять
+## Why this security model is trustworthy
 
-Основная безопасность Noranite не строится на обфускации.
+Noranite's core security does not depend on obfuscation.
 
-Даже если считать wire masking полностью скомпрометированным, защита трафика остаётся основана на стандартных криптографических примитивах:
+Even if wire masking is treated as completely compromised, traffic protection still rests on standard cryptographic primitives:
 
-- Noise IK для mutual authentication и key agreement;
-- X25519 для Diffie-Hellman;
-- ChaCha20-Poly1305 для authenticated encryption;
-- BLAKE2s внутри Noise и для wire masking;
-- независимые ключи для направлений передачи;
-- fresh key material для новых сессий;
+- Noise IK for mutual authentication and key agreement;
+- X25519 for Diffie-Hellman;
+- ChaCha20-Poly1305 for authenticated encryption;
+- BLAKE2s inside Noise and for wire masking;
+- independent keys for each traffic direction;
+- fresh key material for new sessions;
 - monotonic nonces;
 - replay protection.
 
-`K_route` отвечает за то, **как протокол выглядит на проводе**.
+`K_route` controls **what the protocol looks like on the wire**.
 
-Noise и ChaCha20-Poly1305 отвечают за то, **можно ли этому трафику доверять и можно ли его расшифровать**.
+Noise and ChaCha20-Poly1305 control **whether the traffic can be trusted and whether it can be decrypted**.
 
-Это разные задачи и разные криптографические границы.
+These are separate jobs with separate cryptographic boundaries.
 
-## Что видит DPI
+## What DPI sees
 
-Без `K_route` содержимое пакета не предоставляет обычному content-based DPI фиксированного byte pattern.
+Without `K_route`, packet contents expose no fixed byte pattern to ordinary content-based DPI.
 
-На проводе нет открытых:
+The wire format contains no exposed:
 
 - protocol magic;
 - version;
@@ -192,38 +194,37 @@ Noise и ChaCha20-Poly1305 отвечают за то, **можно ли это�
 - inner IPv4 header;
 - Noise static public key;
 - Noise ephemeral public key;
-- постоянного handshake header.
+- constant handshake header.
 
-Handshake имеет переменный размер и random padding.
+Handshake packets have variable sizes and random padding.
 
-DATA имеет per-packet padding.
+DATA packets use per-packet padding.
 
-Служебный трафик использует тот же зашифрованный envelope.
+Control traffic uses the same encrypted envelope.
 
-То есть нельзя написать нормальное правило вида:
+In other words, there is no useful rule of the form:
 
 ```text
 if udp[offset:n] == known_constant:
     protocol = Noranite
 ```
 
-Такого `known_constant` у протокола просто нет.
-
+There is no such `known_constant` in the protocol.
 
 ## Active probing
 
-Noranite не имеет unauthenticated discovery protocol.
+Noranite has no unauthenticated discovery protocol.
 
-Произвольный UDP packet не вызывает узнаваемого ответа сервера.
+An arbitrary UDP packet does not produce a recognizable server response.
 
-Корректный handshake требует:
+A valid handshake requires:
 
-- знания `K_route`;
-- правильного opaque framing;
-- корректного Noise IK exchange;
-- авторизованной client identity.
+- knowledge of `K_route`;
+- correct opaque framing;
+- a valid Noise IK exchange;
+- an authorized client identity.
 
-Поэтому модель обнаружения:
+That rules out the simple discovery model:
 
 ```text
 send probe
@@ -231,13 +232,11 @@ receive VPN banner
 block endpoint
 ```
 
-здесь не работает.
-
 ## Scope
 
-Noranite — небольшой point-to-point L3 protocol.
+Noranite is a small point-to-point L3 protocol.
 
-Текущая версия использует:
+The current version uses:
 
 ```text
 inner network:    IPv4
@@ -246,8 +245,8 @@ topology:         client <-> server
 payload mapping:  one IPv4 packet per UDP datagram
 ```
 
-Протокол не пытается быть универсальным VPN framework, системой маскировки под другие протоколы или средством полной защиты от traffic analysis.
+Noranite is not trying to be a universal VPN framework, a protocol impersonation system, or a complete defense against traffic analysis.
 
-Он решает одну задачу и делает это прямо:
+It solves one problem directly:
 
-**Noranite передаёт аутентифицированный и зашифрованный L3-трафик так, чтобы сам wire format не давал пассивному наблюдателю простой способ определить, что перед ним Noranite.**
+**Noranite carries authenticated, encrypted L3 traffic in a wire format that gives a passive observer no simple way to identify it as Noranite.**
