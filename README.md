@@ -1,6 +1,8 @@
 # Noranite
 
-[English](README.md) · [Русский](README.ru.md) · [Usage](USAGE.md)
+[English](README.md) · [Русский](README.ru.md) 
+
+[Usage scripts](USAGE.md)
 
 Noranite is an anti-censorship L3 tunnel over UDP with no recognizable wire format.
 
