@@ -25,7 +25,7 @@ func TestNoiseClientStartEmitsAuthenticatedIKInit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	endpoint := netip.MustParseAddrPort("192.0.2.10:51820")
+	endpoint := netip.MustParseAddrPort("192.0.2.10:41675")
 
 	factory := newNoiseTestClientFactory(t, clientPrivate, serverPublic, endpoint, clientRandomBytes(11, 0x81))
 	attempt, update, err := factory.Start(time.Unix(1_700_000_000, 123))
@@ -74,7 +74,7 @@ func TestNoiseClientRetryCreatesCompletelyNewExchange(t *testing.T) {
 	clientPrivate := testPrivateKey(1)
 	serverPrivate := testPrivateKey(33)
 	serverPublic, _ := PublicKeyFromPrivate(serverPrivate)
-	endpoint := netip.MustParseAddrPort("192.0.2.10:51820")
+	endpoint := netip.MustParseAddrPort("192.0.2.10:41675")
 	random := append(clientRandomBytes(101, 0x81), clientRandomBytes(202, 0xa1)...)
 	factory := newNoiseTestClientFactory(t, clientPrivate, serverPublic, endpoint, random)
 	now := time.Unix(1_700_000_000, 900)
@@ -106,7 +106,7 @@ func TestNoiseClientFreshnessContinuesAcrossFactoryAttempts(t *testing.T) {
 	clientPrivate := testPrivateKey(1)
 	serverPrivate := testPrivateKey(33)
 	serverPublic, _ := PublicKeyFromPrivate(serverPrivate)
-	endpoint := netip.MustParseAddrPort("192.0.2.10:51820")
+	endpoint := netip.MustParseAddrPort("192.0.2.10:41675")
 	random := append(clientRandomBytes(1, 0x81), clientRandomBytes(2, 0xa1)...)
 	factory := newNoiseTestClientFactory(t, clientPrivate, serverPublic, endpoint, random)
 	now := time.Unix(1_700_000_000, 500)
@@ -130,7 +130,7 @@ func TestNoiseClientDelayedOldResponseDuringRetryIsConsumed(t *testing.T) {
 	clientPrivate := testPrivateKey(1)
 	serverPrivate := testPrivateKey(33)
 	serverPublic, _ := PublicKeyFromPrivate(serverPrivate)
-	endpoint := netip.MustParseAddrPort("192.0.2.10:51820")
+	endpoint := netip.MustParseAddrPort("192.0.2.10:41675")
 	random := append(clientRandomBytes(10, 0x81), clientRandomBytes(20, 0xa1)...)
 	factory := newNoiseTestClientFactory(t, clientPrivate, serverPublic, endpoint, random)
 
@@ -160,7 +160,7 @@ func TestNoiseClientDelayedOldResponseDuringRetryIsConsumed(t *testing.T) {
 
 func TestNoiseClientAcceptsAuthenticatedResponseFromDifferentSource(t *testing.T) {
 	attempt, _, response := makeNoiseClientAttemptAndResponse(t, 333)
-	otherSource := netip.MustParseAddrPort("198.51.100.99:51820")
+	otherSource := netip.MustParseAddrPort("198.51.100.99:41675")
 
 	handled, update, err := handleNoiseTestAttempt(attempt, otherSource, response)
 	if err != nil || !handled || update.Material == nil || update.Material.SessionID != 333 {
@@ -172,7 +172,7 @@ func TestNoiseClientAuthenticatedZeroSessionIDIsSilent(t *testing.T) {
 	clientPrivate := testPrivateKey(1)
 	serverPrivate := testPrivateKey(33)
 	serverPublic, _ := PublicKeyFromPrivate(serverPrivate)
-	endpoint := netip.MustParseAddrPort("192.0.2.10:51820")
+	endpoint := netip.MustParseAddrPort("192.0.2.10:41675")
 	factory := newNoiseTestClientFactory(t, clientPrivate, serverPublic, endpoint, clientRandomBytes(7, 0x81))
 	attempt, init, err := factory.Start(time.Unix(100, 0))
 	if err != nil {
@@ -208,7 +208,7 @@ func TestNoiseClientExchangeIDSkipsZeroAndRejectsPermanentZeroRNG(t *testing.T) 
 	clientPrivate := testPrivateKey(1)
 	serverPrivate := testPrivateKey(33)
 	serverPublic, _ := PublicKeyFromPrivate(serverPrivate)
-	endpoint := netip.MustParseAddrPort("192.0.2.10:51820")
+	endpoint := netip.MustParseAddrPort("192.0.2.10:41675")
 
 	var zero [8]byte
 	random := append([]byte(nil), zero[:]...)
@@ -236,7 +236,7 @@ func TestNoiseClientStartAndRetryRNGFailuresAreLocalErrors(t *testing.T) {
 	clientPrivate := testPrivateKey(1)
 	serverPrivate := testPrivateKey(33)
 	serverPublic, _ := PublicKeyFromPrivate(serverPrivate)
-	endpoint := netip.MustParseAddrPort("192.0.2.10:51820")
+	endpoint := netip.MustParseAddrPort("192.0.2.10:41675")
 
 	factory := newNoiseTestClientFactoryWithReader(t, clientPrivate, serverPublic, endpoint, errorReader{err: io.ErrUnexpectedEOF})
 	if _, _, err := factory.Start(time.Unix(100, 0)); !errors.Is(err, io.ErrUnexpectedEOF) {
@@ -261,7 +261,7 @@ func TestNoiseClientRejectsInvalidConfiguration(t *testing.T) {
 	serverPublic, _ := PublicKeyFromPrivate(serverPrivate)
 
 	_, err := NewClient(ClientConfig{
-		ServerEndpoint:   netip.MustParseAddrPort("[2001:db8::1]:51820"),
+		ServerEndpoint:   netip.MustParseAddrPort("[2001:db8::1]:41675"),
 		StaticPrivateKey: clientPrivate,
 		ServerPublicKey:  serverPublic,
 	})
@@ -270,7 +270,7 @@ func TestNoiseClientRejectsInvalidConfiguration(t *testing.T) {
 	}
 
 	_, err = NewClient(ClientConfig{
-		ServerEndpoint:   netip.MustParseAddrPort("192.0.2.10:51820"),
+		ServerEndpoint:   netip.MustParseAddrPort("192.0.2.10:41675"),
 		StaticPrivateKey: PrivateKey{},
 		ServerPublicKey:  serverPublic,
 	})
@@ -279,7 +279,7 @@ func TestNoiseClientRejectsInvalidConfiguration(t *testing.T) {
 	}
 
 	_, err = NewClient(ClientConfig{
-		ServerEndpoint:   netip.MustParseAddrPort("192.0.2.10:51820"),
+		ServerEndpoint:   netip.MustParseAddrPort("192.0.2.10:41675"),
 		StaticPrivateKey: clientPrivate,
 		ServerPublicKey:  PublicKey{},
 	})
@@ -292,7 +292,7 @@ func TestNoiseClientIntegratesWithSessionController(t *testing.T) {
 	clientPrivate := testPrivateKey(1)
 	serverPrivate := testPrivateKey(33)
 	serverPublic, _ := PublicKeyFromPrivate(serverPrivate)
-	endpoint := netip.MustParseAddrPort("192.0.2.10:51820")
+	endpoint := netip.MustParseAddrPort("192.0.2.10:41675")
 	tunnelIPv4 := netip.MustParseAddr("10.66.0.2")
 
 	core, err := coreclient.New(coreclient.Config{
@@ -365,7 +365,7 @@ func TestNoiseClientClassifierOwnsHiddenRouteNamespaceForLifetime(t *testing.T) 
 	clientPrivate := testPrivateKey(1)
 	serverPrivate := testPrivateKey(33)
 	serverPublic, _ := PublicKeyFromPrivate(serverPrivate)
-	factory := newNoiseTestClientFactory(t, clientPrivate, serverPublic, netip.MustParseAddrPort("192.0.2.10:51820"), clientRandomBytes(1, 0x81))
+	factory := newNoiseTestClientFactory(t, clientPrivate, serverPublic, netip.MustParseAddrPort("192.0.2.10:41675"), clientRandomBytes(1, 0x81))
 
 	packet := make([]byte, ResponseMinPacketSize)
 	if !factory.IsEstablishmentDatagram(dataplane.Route{SessionID: 0, Sequence: 1}, true, packet) {
@@ -418,7 +418,7 @@ func makeNoiseClientAttemptAndResponse(t *testing.T, sessionID uint64) (coreclie
 	clientPrivate := testPrivateKey(1)
 	serverPrivate := testPrivateKey(33)
 	serverPublic, _ := PublicKeyFromPrivate(serverPrivate)
-	endpoint := netip.MustParseAddrPort("192.0.2.10:51820")
+	endpoint := netip.MustParseAddrPort("192.0.2.10:41675")
 	factory := newNoiseTestClientFactory(t, clientPrivate, serverPublic, endpoint, clientRandomBytes(1, 0x81))
 	attempt, init, err := factory.Start(time.Unix(100, 0))
 	if err != nil {

@@ -16,7 +16,7 @@ func newClientOperationCore(
 ) (*Core, [32]byte, netip.AddrPort) {
 	t.Helper()
 	routeKey, _, _ := testKeys()
-	serverEndpoint := netip.MustParseAddrPort("198.51.100.10:51820")
+	serverEndpoint := netip.MustParseAddrPort("198.51.100.10:41675")
 	core, err := New(Config{
 		RouteKey:           routeKey,
 		TunnelIPv4:         netip.MustParseAddr("10.66.0.2"),

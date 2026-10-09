@@ -63,10 +63,10 @@ Noranite не делает блокировку невозможной. Он д�
 Для Debian/Ubuntu сервер можно установить одной командой:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/noranite/Noranite-l3/main/install/server/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/noranite/Noranite-l3/main/quick-install | sudo bash
 ```
 
-Bootstrap скачивает исходники с GitHub во временный каталог, при необходимости использует временный Go toolchain нужной версии, собирает серверные бинарники и запускает штатный installer. При первой установке он попросит выбрать Internet-facing interface, tunnel address, UDP port, MTU (рекомендуется не более 1380) и режим доступа к локальной сети. При повторном запуске существующие `/etc/noranite/server.env`, ключи и peers сохраняются.
+Quick installer скачивает исходники с GitHub во временный каталог, при необходимости использует временный Go toolchain нужной версии, собирает серверные бинарники и запускает штатный installer. При первой установке он автоматически определит Internet-facing interface и попросит выбрать tunnel address, UDP port, MTU (рекомендуется не более 1380) и режим доступа к локальной сети. При повторном запуске существующие `/etc/noranite/server.env`, ключи и peers сохраняются.
 
 Ручной вариант начинается со сборки необходимых бинарников из корня репозитория:
 
@@ -84,13 +84,13 @@ go build -o bin/opaque-keygen ./cmd/opaque-keygen
 sudo ./install/server/install.sh
 ```
 
-По умолчанию используется tunnel `10.66.0.1/16`, UDP `0.0.0.0:51820`, MTU `1380`, а Internet-facing interface определяется по default route. При первой установке основные параметры можно задать явно:
+По умолчанию используется tunnel `10.66.0.1/16`, UDP `0.0.0.0:41675`, MTU `1380`, а Internet-facing interface определяется по default route. При первой установке основные параметры можно задать явно:
 
 ```bash
 sudo ./install/server/install.sh \
   --egress-interface eth0 \
   --tunnel-address 10.66.0.1/16 \
-  --bind 0.0.0.0:51820 \
+  --bind 0.0.0.0:41675 \
   --mtu 1380 \
   --local-access deny
 ```
@@ -101,6 +101,7 @@ sudo ./install/server/install.sh \
 
 ```text
 server.env       network/runtime parameters
+install.state     host state needed for clean uninstall
 route.key        shared K_route
 server.private   server X25519 private key
 server.public    server X25519 public key
@@ -114,6 +115,14 @@ sudo systemctl status noranite-server
 sudo systemctl restart noranite-server
 sudo journalctl -u noranite-server -f
 ```
+
+Полное удаление сервера, включая ключи, persistent peers, systemd units, firewall rules и установленные бинарники:
+
+```bash
+sudo ./uninstall
+```
+
+`uninstall` просит явное подтверждение перед удалением `/etc/noranite`. Для автоматического запуска используется `sudo ./uninstall --yes`. Пакеты ОС, которые могли существовать до Noranite или использоваться другими программами, uninstall не удаляет.
 
 ### Пиры
 

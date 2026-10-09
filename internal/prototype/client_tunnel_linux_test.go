@@ -123,7 +123,7 @@ func TestNewClientRuntimeRejectsEngineBatchSmallerThanTun(t *testing.T) {
 	core, err := client.New(client.Config{
 		RouteKey:           routeKey,
 		TunnelIPv4:         netip.MustParseAddr("10.88.0.2"),
-		ServerEndpoint:     netip.MustParseAddrPort("127.0.0.1:51820"),
+		ServerEndpoint:     netip.MustParseAddrPort("127.0.0.1:41675"),
 		MaxInnerPacketSize: dataplane.ReferenceTunnelMTU,
 		Lifecycle: client.LifecycleConfig{
 			GenerationLifetime: 30 * time.Second,

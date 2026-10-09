@@ -38,7 +38,7 @@ func main() {
 
 	bindText := flag.String(
 		"bind",
-		"192.0.2.1:51820",
+		"192.0.2.1:41675",
 		"outer server UDP bind address",
 	)
 

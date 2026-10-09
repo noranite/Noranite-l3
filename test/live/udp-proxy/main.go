@@ -472,7 +472,7 @@ func forwardPacket(
 
 func main() {
 	listenText := flag.String("listen", "192.0.2.2:51821", "proxy UDP listen endpoint")
-	serverText := flag.String("server", "192.0.2.1:51820", "real server UDP endpoint")
+	serverText := flag.String("server", "192.0.2.1:41675", "real server UDP endpoint")
 	routeKeyFile := flag.String("route-key-file", "", "standard-Base64 encoded 32-byte route key file")
 	modeText := flag.String("mode", string(modePass), "fault mode")
 	targetResponse := flag.Int(

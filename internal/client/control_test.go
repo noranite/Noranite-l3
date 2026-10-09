@@ -24,7 +24,7 @@ func TestClientKeepaliveServerACKRoundTrip(t *testing.T) {
 	}
 
 	clientTunnel := netip.MustParseAddr("10.66.0.2")
-	serverEndpoint := netip.MustParseAddrPort("198.51.100.10:51820")
+	serverEndpoint := netip.MustParseAddrPort("198.51.100.10:41675")
 	clientEndpoint := netip.MustParseAddrPort("192.0.2.10:50000")
 
 	clientCore, err := New(Config{

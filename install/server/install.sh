@@ -6,15 +6,17 @@ ROOT_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 BIN_DIR="${ROOT_DIR}/bin"
 CONFIG_DIR="/etc/noranite"
 CONFIG_FILE="${CONFIG_DIR}/server.env"
+INSTALL_STATE_FILE="${CONFIG_DIR}/install.state"
 LIBEXEC_DIR="/usr/local/libexec/noranite"
 SYSTEMD_DIR="/etc/systemd/system"
 
 EGRESS_IFACE=""
 TUNNEL_ADDRESS="10.66.0.1/16"
-BIND_ADDRESS="0.0.0.0:51820"
+BIND_ADDRESS="0.0.0.0:41675"
 MTU="1380"
 LOCAL_ACCESS="deny"
 NETWORK_OPTION_SEEN=0
+FIRST_INSTALL=0
 
 usage() {
 	cat <<USAGE
@@ -27,7 +29,7 @@ options:
   --bin-dir DIR              directory containing built Noranite binaries
   --egress-interface IFACE   Internet-facing interface (auto-detected initially)
   --tunnel-address IP/16     server tunnel address (default: 10.66.0.1/16)
-  --bind IPv4:PORT           UDP listen address (default: 0.0.0.0:51820)
+  --bind IPv4:PORT           UDP listen address (default: 0.0.0.0:41675)
   --mtu MTU                  tunnel MTU (default: 1380)
   --local-access MODE        local/LAN access: deny or allow (default: deny)
   -h, --help                 show this help
@@ -109,6 +111,10 @@ if [[ -e "${CONFIG_FILE}" ]] && (( NETWORK_OPTION_SEEN )); then
 	exit 1
 fi
 
+if [[ ! -e "${CONFIG_FILE}" ]]; then
+	FIRST_INSTALL=1
+fi
+
 install -d -m 0700 "${CONFIG_DIR}"
 install -d -m 0755 /usr/local/bin
 install -d -m 0755 "${LIBEXEC_DIR}"
@@ -124,6 +130,9 @@ install -m 0644 "${SCRIPT_DIR}/noranite-server.service" "${SYSTEMD_DIR}/noranite
 if [[ -e "${CONFIG_FILE}" ]]; then
 	echo "preserving existing ${CONFIG_FILE}"
 else
+	if [[ -z "${EGRESS_IFACE}" ]]; then
+		EGRESS_IFACE="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')"
+	fi
 	if [[ -z "${EGRESS_IFACE}" ]]; then
 		EGRESS_IFACE="$(ip -4 route show default | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')"
 	fi
@@ -165,6 +174,19 @@ fi
 
 if [[ ! -e "${CONFIG_DIR}/server.peers" ]]; then
 	install -m 0600 /dev/null "${CONFIG_DIR}/server.peers"
+fi
+
+if (( FIRST_INSTALL )) && [[ ! -e "${INSTALL_STATE_FILE}" ]]; then
+	original_ip_forward="$(sysctl -n net.ipv4.ip_forward)"
+	case "${original_ip_forward}" in
+		0|1) ;;
+		*)
+		echo "error: unexpected net.ipv4.ip_forward value: ${original_ip_forward}" >&2
+		exit 1
+		;;
+	esac
+	umask 077
+	printf 'NRNT_ORIGINAL_IP_FORWARD=%s\n' "${original_ip_forward}" >"${INSTALL_STATE_FILE}"
 fi
 
 systemctl daemon-reload

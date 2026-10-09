@@ -48,7 +48,7 @@ func main() {
 
 	serverText := flag.String(
 		"server",
-		"192.0.2.1:51820",
+		"192.0.2.1:41675",
 		"outer server UDP endpoint",
 	)
 

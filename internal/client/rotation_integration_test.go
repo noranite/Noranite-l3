@@ -17,7 +17,7 @@ func TestClientServerDirectRotationWithoutACKDependency(t *testing.T) {
 
 	clientTunnel := netip.MustParseAddr("10.66.0.2")
 	serverTunnel := netip.MustParseAddr("10.66.0.1")
-	serverEndpoint := netip.MustParseAddrPort("198.51.100.10:51820")
+	serverEndpoint := netip.MustParseAddrPort("198.51.100.10:41675")
 	clientEndpoint := netip.MustParseAddrPort("192.0.2.10:50000")
 	lifecycle := LifecycleConfig{
 		GenerationLifetime: 30 * time.Second,

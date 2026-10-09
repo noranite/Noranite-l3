@@ -90,7 +90,7 @@ func TestPeerCurrentAuthenticatedRXArmsPreviousGraceFromReceivedAt(t *testing.T)
 	result, err := peer.CommitAuthenticatedRX(
 		admission,
 		sequence,
-		netip.MustParseAddrPort("198.51.100.10:51820"),
+		netip.MustParseAddrPort("198.51.100.10:41675"),
 	)
 	if err != nil {
 		t.Fatalf("CommitAuthenticatedRX(B): %v", err)
@@ -144,7 +144,7 @@ func TestPeerDelayedCurrentCommitDoesNotRetroactivelyCancelPreviousAdmission(t *
 	if result, err := peer.CommitAuthenticatedRX(
 		bAdmission,
 		bSequence,
-		netip.MustParseAddrPort("198.51.100.10:51820"),
+		netip.MustParseAddrPort("198.51.100.10:41675"),
 	); err != nil {
 		t.Fatalf("CommitAuthenticatedRX(B): %v", err)
 	} else if !result.ArmedPreviousGrace {
@@ -158,7 +158,7 @@ func TestPeerDelayedCurrentCommitDoesNotRetroactivelyCancelPreviousAdmission(t *
 	if _, err := peer.CommitAuthenticatedRX(
 		aAdmission,
 		aSequence,
-		netip.MustParseAddrPort("198.51.100.10:51820"),
+		netip.MustParseAddrPort("198.51.100.10:41675"),
 	); err != nil {
 		t.Fatalf("already-admitted A failed after grace became armed: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestPeerStaleCurrentCompletionAfterInstallDoesNotArmNewPreviousGrace(t *tes
 	result, err := peer.CommitAuthenticatedRX(
 		bAdmission,
 		bSequence,
-		netip.MustParseAddrPort("198.51.100.10:51820"),
+		netip.MustParseAddrPort("198.51.100.10:41675"),
 	)
 	if err != nil {
 		t.Fatalf("CommitAuthenticatedRX(stale B): %v", err)
@@ -369,7 +369,7 @@ func TestPeerHardRXDeadlineDoesNotCancelAdmittedOperation(t *testing.T) {
 	if _, err := peer.CommitAuthenticatedRX(
 		admission,
 		sequence,
-		netip.MustParseAddrPort("198.51.100.10:51820"),
+		netip.MustParseAddrPort("198.51.100.10:41675"),
 	); err != nil {
 		t.Fatalf("already-admitted RX failed after hard deadline: %v", err)
 	}

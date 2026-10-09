@@ -283,7 +283,7 @@ func newNoiseLifecycleHarness(
 	clientIP := netip.MustParseAddr("10.66.0.2")
 	serverIP := netip.MustParseAddr("10.66.0.1")
 	clientEndpoint := netip.MustParseAddrPort("198.51.100.20:40000")
-	serverEndpoint := netip.MustParseAddrPort("192.0.2.10:51820")
+	serverEndpoint := netip.MustParseAddrPort("192.0.2.10:41675")
 	clientPrivate := testPrivateKey(1)
 	serverPrivate := testPrivateKey(33)
 	clientPublic, err := PublicKeyFromPrivate(clientPrivate)

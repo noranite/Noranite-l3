@@ -55,7 +55,7 @@ func TestNoiseServerAuthenticatedClientInstallsConfiguredPeerBeforeResponse(t *t
 
 	freshness := testFreshness(1_700_000_000, 1)
 	initPacket, clientHandshake := makeNoiseTestInit(t, clientPrivate, serverPublic, 77, freshness, 0x81, routeKey)
-	source := netip.MustParseAddrPort("192.0.2.10:51820")
+	source := netip.MustParseAddrPort("192.0.2.10:41675")
 
 	handled, response, destination, err := handleNoiseTestServer(provider, source, initPacket)
 	if err != nil {

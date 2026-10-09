@@ -135,7 +135,7 @@ func TestServerClientRoundTrip(t *testing.T) {
 	}
 
 	serverEndpoint := netip.MustParseAddrPort(
-		"198.51.100.10:51820",
+		"198.51.100.10:41675",
 	)
 
 	openedByClient, err := client.AuthenticateInPlace(

@@ -6,10 +6,10 @@ REF="${NORANITE_REF:-main}"
 CONFIG_FILE="/etc/noranite/server.env"
 
 TUNNEL_ADDRESS="${NORANITE_TUNNEL_ADDRESS:-10.66.0.1/16}"
-UDP_PORT="${NORANITE_PORT:-51820}"
+UDP_PORT="${NORANITE_PORT:-41675}"
 MTU="${NORANITE_MTU:-1380}"
 LOCAL_ACCESS="${NORANITE_LOCAL_ACCESS:-deny}"
-EGRESS_IFACE="${NORANITE_EGRESS_IFACE:-}"
+EGRESS_IFACE=""
 NONINTERACTIVE="${NORANITE_NONINTERACTIVE:-0}"
 
 TMP_DIR=""
@@ -35,27 +35,18 @@ prompt_default() {
 	if [[ ! -r /dev/tty ]]; then
 		fail "interactive terminal is required for first install; set NORANITE_NONINTERACTIVE=1 to use environment/default values"
 	fi
-	read -r -p "${label} [${default_value}]: " answer </dev/tty
-	printf -v "${variable_name}" '%s' "${answer:-${default_value}}"
+	read -r -e -i "${default_value}" -p "${label}: " answer </dev/tty
+	printf -v "${variable_name}" '%s' "${answer}"
 }
 
-prompt_local_access() {
-	local answer=""
-	local prompt="Allow VPN clients to access the server/LAN? [y/N]: "
-	if [[ "${LOCAL_ACCESS}" == "allow" ]]; then
-		prompt="Allow VPN clients to access the server/LAN? [Y/n]: "
-	fi
+detect_egress_iface() {
+	local iface=""
 
-	if [[ ! -r /dev/tty ]]; then
-		return
+	iface="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')"
+	if [[ -z "${iface}" ]]; then
+		iface="$(ip -4 route show default | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')"
 	fi
-	read -r -p "${prompt}" answer </dev/tty
-	case "${answer}" in
-		y|Y|yes|YES) LOCAL_ACCESS="allow" ;;
-		n|N|no|NO) LOCAL_ACCESS="deny" ;;
-		"") ;;
-		*) fail "expected yes or no" ;;
-	esac
+	printf '%s\n' "${iface}"
 }
 
 install_dependencies_if_needed() {
@@ -144,7 +135,7 @@ validate_first_install_options() {
 }
 
 if (( EUID != 0 )); then
-	fail "run this bootstrap as root (for example: curl ... | sudo bash)"
+	fail "run quick-install as root (for example: curl ... | sudo bash)"
 fi
 
 install_dependencies_if_needed
@@ -155,21 +146,17 @@ if [[ ! -d /run/systemd/system ]]; then
 fi
 
 if [[ ! -e "${CONFIG_FILE}" ]]; then
-	if [[ -z "${EGRESS_IFACE}" ]]; then
-		EGRESS_IFACE="$(ip -4 route show default | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')"
-	fi
+	EGRESS_IFACE="$(detect_egress_iface)"
 	[[ -n "${EGRESS_IFACE}" ]] || fail "could not auto-detect the Internet-facing interface"
 
 	if [[ "${NONINTERACTIVE}" == "1" ]]; then
 		echo "Noranite server setup (non-interactive)"
 	else
 		echo "Noranite server setup"
-		echo "Press Enter to accept a default value."
-		prompt_default EGRESS_IFACE "Internet-facing interface" "${EGRESS_IFACE}"
 		prompt_default TUNNEL_ADDRESS "Tunnel address" "${TUNNEL_ADDRESS}"
 		prompt_default UDP_PORT "UDP listen port" "${UDP_PORT}"
 		prompt_default MTU "Tunnel MTU" "${MTU}"
-		prompt_local_access
+		prompt_default LOCAL_ACCESS "Local access (deny/allow)" "${LOCAL_ACCESS}"
 	fi
 	validate_first_install_options
 else

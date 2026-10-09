@@ -29,7 +29,7 @@ The harness copies `opaque-server`, `opaque-trafficgen`, and the pinned
 `wireguard-go` binary to a temporary directory on the server. Both machines
 must therefore use a compatible Linux architecture/ABI.
 
-Outer UDP ports default to 51820 for Opaque and 51822 for wireguard-go. They
+Outer UDP ports default to 41675 for Opaque and 51822 for wireguard-go. They
 must be reachable from the client host. Tunnel benchmarking itself does not
 require exposing iperf TCP ports on the physical interface: iperf listens on
 the inner tunnel address.

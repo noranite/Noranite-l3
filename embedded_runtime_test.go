@@ -137,7 +137,7 @@ func TestClientConstructAndCloseBeforeRun(t *testing.T) {
 
 	client, err := NewClient(ClientConfig{
 		TunnelIPv4:       netip.MustParseAddr("10.66.0.2"),
-		ServerEndpoint:   netip.MustParseAddrPort("192.0.2.1:51820"),
+		ServerEndpoint:   netip.MustParseAddrPort("192.0.2.1:41675"),
 		MTU:              DefaultMTU,
 		RouteKey:         [32]byte{1},
 		StaticPrivateKey: clientPrivate,
@@ -490,7 +490,7 @@ func (d *shortWritePacketDevice) Write(_ [][]byte, _ int) (int, error) {
 
 func TestEmbeddedRuntimeStartsWithoutInitialTransport(t *testing.T) {
 	clientIP := netip.MustParseAddr("10.66.0.2")
-	serverEndpoint := netip.MustParseAddrPort("192.0.2.1:51820")
+	serverEndpoint := netip.MustParseAddrPort("192.0.2.1:41675")
 	var routeKey, c2s, s2c [32]byte
 	for i := range routeKey {
 		routeKey[i] = byte(i + 1)
@@ -561,7 +561,7 @@ func TestEmbeddedRuntimeStartsWithoutInitialTransport(t *testing.T) {
 
 func TestEmbeddedRuntimeExternalCurrentTransportCloseIsRecoverable(t *testing.T) {
 	clientIP := netip.MustParseAddr("10.66.0.2")
-	serverEndpoint := netip.MustParseAddrPort("192.0.2.1:51820")
+	serverEndpoint := netip.MustParseAddrPort("192.0.2.1:41675")
 	var routeKey, c2s, s2c [32]byte
 	for i := range routeKey {
 		routeKey[i] = byte(i + 1)
@@ -647,7 +647,7 @@ func TestEmbeddedRuntimeExternalCurrentTransportCloseIsRecoverable(t *testing.T)
 
 func TestEmbeddedRuntimeWriteFailureInvalidatesCurrentTransport(t *testing.T) {
 	clientIP := netip.MustParseAddr("10.66.0.2")
-	serverEndpoint := netip.MustParseAddrPort("192.0.2.1:51820")
+	serverEndpoint := netip.MustParseAddrPort("192.0.2.1:41675")
 	var routeKey, c2s, s2c [32]byte
 	for i := range routeKey {
 		routeKey[i] = byte(i + 1)
@@ -711,7 +711,7 @@ func TestEmbeddedRuntimeWriteFailureInvalidatesCurrentTransport(t *testing.T) {
 
 func TestEmbeddedRuntimeReplacementDoesNotWaitForBlockedWrite(t *testing.T) {
 	clientIP := netip.MustParseAddr("10.66.0.2")
-	serverEndpoint := netip.MustParseAddrPort("192.0.2.1:51820")
+	serverEndpoint := netip.MustParseAddrPort("192.0.2.1:41675")
 	var routeKey, c2s, s2c [32]byte
 	for i := range routeKey {
 		routeKey[i] = byte(i + 1)
@@ -797,7 +797,7 @@ func TestEmbeddedRuntimeReplacementDoesNotWaitForBlockedWrite(t *testing.T) {
 
 func TestEmbeddedRuntimeEMSGSIZEDoesNotInvalidateTransport(t *testing.T) {
 	clientIP := netip.MustParseAddr("10.66.0.2")
-	serverEndpoint := netip.MustParseAddrPort("192.0.2.1:51820")
+	serverEndpoint := netip.MustParseAddrPort("192.0.2.1:41675")
 	var routeKey, c2s, s2c [32]byte
 	for i := range routeKey {
 		routeKey[i] = byte(i + 1)
@@ -1369,7 +1369,7 @@ func testPublicClientConfig(t *testing.T, mtu int) ClientConfig {
 	}
 	return ClientConfig{
 		TunnelIPv4:       netip.MustParseAddr("10.66.0.2"),
-		ServerEndpoint:   netip.MustParseAddrPort("192.0.2.1:51820"),
+		ServerEndpoint:   netip.MustParseAddrPort("192.0.2.1:41675"),
 		MTU:              mtu,
 		RouteKey:         [32]byte{1},
 		StaticPrivateKey: [32]byte(clientPrivate),

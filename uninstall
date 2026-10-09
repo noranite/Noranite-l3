@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONFIG_DIR="/etc/noranite"
+INSTALL_STATE_FILE="${CONFIG_DIR}/install.state"
+LIBEXEC_DIR="/usr/local/libexec/noranite"
+SYSTEMD_DIR="/etc/systemd/system"
+TUN_IFACE="nrnt0"
+INPUT_CHAIN="NORANITE-IN"
+FORWARD_CHAIN="NORANITE-FWD"
+NAT_CHAIN="NORANITE-NAT"
+ASSUME_YES=0
+
+usage() {
+	cat <<USAGE
+usage: $0 [--yes]
+
+Removes the Noranite server, including its systemd units, binaries,
+network rules, keys, configuration, and persistent peers.
+
+options:
+  -y, --yes   do not ask for confirmation
+  -h, --help  show this help
+USAGE
+}
+
+fail() {
+	echo "error: $*" >&2
+	exit 1
+}
+
+while (($#)); do
+	case "$1" in
+		-y|--yes)
+			ASSUME_YES=1
+			shift
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			fail "unknown option: $1"
+			;;
+	esac
+done
+
+if (( EUID != 0 )); then
+	fail "uninstaller must run as root"
+fi
+
+if (( ! ASSUME_YES )); then
+	if [[ ! -r /dev/tty ]]; then
+		fail "interactive terminal is unavailable; use --yes for non-interactive removal"
+	fi
+	printf '%s\n' "This removes Noranite completely, including /etc/noranite keys and peers."
+	read -r -p "Type 'yes' to continue: " answer </dev/tty
+	[[ "${answer}" == "yes" ]] || { echo "Cancelled."; exit 0; }
+fi
+
+original_ip_forward=""
+if [[ -r "${INSTALL_STATE_FILE}" ]]; then
+	original_ip_forward="$(awk -F= '$1 == "NRNT_ORIGINAL_IP_FORWARD" {print $2; exit}' "${INSTALL_STATE_FILE}" 2>/dev/null | tr -d '[:space:]' || true)"
+	case "${original_ip_forward}" in
+		0|1) ;;
+		*) original_ip_forward="" ;;
+	esac
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+	systemctl disable --now noranite-server.service >/dev/null 2>&1 || true
+	systemctl disable --now noranite-server-network.service >/dev/null 2>&1 || true
+fi
+
+# Remove Noranite firewall entry points even if the helper or systemd unit is
+# already missing after a partial install/upgrade.
+if command -v iptables >/dev/null 2>&1; then
+	ipt() { iptables -w 5 "$@"; }
+	remove_jump() {
+		local table="$1" parent="$2" chain="$3"
+		while ipt -t "${table}" -C "${parent}" -j "${chain}" >/dev/null 2>&1; do
+			ipt -t "${table}" -D "${parent}" -j "${chain}" || break
+		done
+	}
+	remove_jump filter INPUT "${INPUT_CHAIN}"
+	remove_jump filter FORWARD "${FORWARD_CHAIN}"
+	remove_jump nat POSTROUTING "${NAT_CHAIN}"
+	ipt -t filter -F "${INPUT_CHAIN}" >/dev/null 2>&1 || true
+	ipt -t filter -X "${INPUT_CHAIN}" >/dev/null 2>&1 || true
+	ipt -t filter -F "${FORWARD_CHAIN}" >/dev/null 2>&1 || true
+	ipt -t filter -X "${FORWARD_CHAIN}" >/dev/null 2>&1 || true
+	ipt -t nat -F "${NAT_CHAIN}" >/dev/null 2>&1 || true
+	ipt -t nat -X "${NAT_CHAIN}" >/dev/null 2>&1 || true
+fi
+
+if command -v ip >/dev/null 2>&1 && ip link show dev "${TUN_IFACE}" >/dev/null 2>&1; then
+	ip link delete dev "${TUN_IFACE}" >/dev/null 2>&1 || true
+fi
+
+rm -f \
+	/usr/local/bin/opaque-server \
+	/usr/local/bin/noranitectl \
+	/usr/local/bin/noranite-peer \
+	/usr/local/bin/opaque-keygen \
+	"${SYSTEMD_DIR}/noranite-server.service" \
+	"${SYSTEMD_DIR}/noranite-server-network.service"
+rm -rf "${LIBEXEC_DIR}" "${CONFIG_DIR}" /run/noranite
+
+if command -v systemctl >/dev/null 2>&1; then
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	systemctl reset-failed noranite-server.service noranite-server-network.service >/dev/null 2>&1 || true
+fi
+
+if [[ -n "${original_ip_forward}" ]] && command -v sysctl >/dev/null 2>&1; then
+	sysctl -q -w "net.ipv4.ip_forward=${original_ip_forward}" || true
+else
+	echo "Note: original net.ipv4.ip_forward value is unknown; it was left unchanged."
+fi
+
+echo "Noranite has been removed."

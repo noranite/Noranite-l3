@@ -50,7 +50,7 @@ func TestClientServerRoundTrip(t *testing.T) {
 	serverTunnelIPv4 := netip.MustParseAddr("10.66.0.1")
 
 	serverEndpoint := netip.MustParseAddrPort(
-		"198.51.100.10:51820",
+		"198.51.100.10:41675",
 	)
 
 	clientEndpoint := netip.MustParseAddrPort(
@@ -249,7 +249,7 @@ func TestConcurrentDuplicateDeliveryAcceptsExactlyOneCopy(t *testing.T) {
 		t.Fatalf("NewSession(server): %v", err)
 	}
 
-	serverEndpoint := netip.MustParseAddrPort("198.51.100.10:51820")
+	serverEndpoint := netip.MustParseAddrPort("198.51.100.10:41675")
 	clientCore, err := New(Config{
 		RouteKey:           routeKey,
 		TunnelIPv4:         netip.MustParseAddr("10.66.0.2"),
@@ -350,7 +350,7 @@ func TestClientRejectsWrongLocalSourceWithoutConsumingSequence(
 		),
 
 		ServerEndpoint: netip.MustParseAddrPort(
-			"198.51.100.10:51820",
+			"198.51.100.10:41675",
 		),
 
 		MaxInnerPacketSize: dataplane.ReferenceTunnelMTU,
@@ -440,7 +440,7 @@ func TestClientRejectsAuthenticatedPacketForAnotherTunnelAddress(
 		),
 
 		ServerEndpoint: netip.MustParseAddrPort(
-			"198.51.100.10:51820",
+			"198.51.100.10:41675",
 		),
 
 		MaxInnerPacketSize: dataplane.ReferenceTunnelMTU,
@@ -486,7 +486,7 @@ func TestClientRejectsAuthenticatedPacketForAnotherTunnelAddress(
 	_, err = core.HandleDatagramInPlace(
 		clientRX,
 		netip.MustParseAddrPort(
-			"198.51.100.10:51820",
+			"198.51.100.10:41675",
 		),
 		wire,
 	)
@@ -584,7 +584,7 @@ func TestNewMaxInnerPacketSizeBounds(t *testing.T) {
 	config := Config{
 		RouteKey:       [32]byte{1},
 		TunnelIPv4:     netip.MustParseAddr("10.66.0.2"),
-		ServerEndpoint: netip.MustParseAddrPort("192.0.2.1:51820"),
+		ServerEndpoint: netip.MustParseAddrPort("192.0.2.1:41675"),
 		Lifecycle:      testLifecycleConfig(),
 	}
 	for _, size := range []int{-1, 0, 1, 19, 20, dataplane.MaxTunnelMTU, dataplane.MaxTunnelMTU + 1} {

@@ -24,7 +24,7 @@ func TestServerEstablishmentExecutorComposesWithNoiseProvider(t *testing.T) {
 
 	clientIP := netip.MustParseAddr("10.77.0.2")
 	clientEndpoint := netip.MustParseAddrPort("198.51.100.30:41000")
-	serverEndpoint := netip.MustParseAddrPort("192.0.2.30:51820")
+	serverEndpoint := netip.MustParseAddrPort("192.0.2.30:41675")
 	clientPrivate := prototypeNoisePrivateKey(1)
 	serverPrivate := prototypeNoisePrivateKey(33)
 	clientPublic, err := noisehandshake.PublicKeyFromPrivate(clientPrivate)
