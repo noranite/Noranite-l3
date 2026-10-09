@@ -45,20 +45,19 @@ DATA, служебные пакеты и handshake различаются тол
 
 ## Зачем вообще нужен "бинарный шум"
 
-Смысл не в самих случайных байтах, а в том, что они лишают DPI дешёвой и точной сигнатуры. Если протокол как-то себя выдает, его можно блокировать почти без побочного ущерба. Если же packet payload неотличим от обычного encrypted UDP, остаётся либо дорогой behavioral analysis по timing, размерам и структуре flow, либо грубая блокировка широкого класса UDP-трафика вместе с HTTP/3/QUIC, WebRTC, real-time media, играми, VPN и собственными протоколами приложений.
+Смысл не в самих случайных байтах, а в том, что они лишают DPI дешёвой и точной сигнатуры. Fixed magic, открытый тип пакета или узнаваемый handshake дают content-based DPI готовое правило. У Noranite такого правила нет.
 
-Все, что мы даем стороннему наблюдателю - это картина "какой-то странный трафик". Но под это определение подходит большая часть UDP трафика интернета.
-Чем меньше протокол сообщает о себе на wire, тем больше вычислительной работы, false positives и collateral damage требуется цензору для его блокировки.
-Поведенческий анализ трафика все равно остается возможным, но Noranite - L3 tunnel, обеспечивающий мультиплексирование и размытие размеров пакетов, что значительно затрудняет даже такой анализ (USENIX Security 2024)
+Подход "зашифровать payload с первого байта и не оставлять fixed header" обычно относят к fully encrypted, или "looks like random", transports. Именно такую модель разбирает [*How the Great Firewall of China Detects and Blocks Fully Encrypted Traffic* (USENIX Security 2023)](https://www.usenix.org/conference/usenixsecurity23/presentation/wu-mingshi). Эта же работа хорошо показывает ограничение идеи: high-entropy traffic не становится автоматически нераспознаваемым — исследованный механизм GFW классифицировал fully encrypted TCP с помощью эвристик по первому payload.
+
+При этом в измерениях 2023 года конкретно этот механизм не затрагивал UDP: UDP datagram со случайным payload не вызывал блокировку. Это наблюдение о конкретной реализации GFW, а не гарантия для UDP вообще. [*Exposing and Circumventing SNI-based QUIC Censorship of the Great Firewall of China* (USENIX Security 2025)](https://www.usenix.org/conference/usenixsecurity25/presentation/zohaib) позднее показала, что GFW умеет stateful-анализ QUIC поверх UDP, включая расшифровку QUIC Initial и protocol-specific filtering.
+
+Без фиксированной content signature цензор всё равно может использовать IP/endpoint information, размеры пакетов, timing, направления, burst structure, объём трафика и statistical classification. Noranite не пытается полностью скрыть эти признаки.
+
+Но Noranite — L3 tunnel: разные внутренние application flows естественным образом мультиплексируются в один внешний UDP flow, а DATA дополнительно получает 0..15 байт случайного authenticated padding. Такое перемешивание нарушает паттерны размеров, timing и direction. [*Fingerprinting Obfuscated Proxy Traffic with Encapsulated TLS Handshakes* (USENIX Security 2024)](https://www.usenix.org/conference/usenixsecurity24/presentation/xue-fingerprinting) показывает, что stream multiplexing действительно может быть эффективной контрмерой против такого анализа, но одновременно подчёркивает, что multiplexing и random padding сами по себе не уничтожают все flow-level fingerprints.
+
+Более общий trade-off разбирается в [*Censorship Evasion with Unidentified Protocol Generation* (USENIX Security 2025)](https://www.usenix.org/conference/usenixsecurity25/presentation/wails): если encrypted protocol нельзя надёжно выделить на уровне протокольной сигнатуры, блокировка всего класса unidentified traffic начинает задевать другие encrypted protocols.
 
 Noranite не делает блокировку невозможной. Он делает её **грязной и очень дорогой**.
-
-## Что говорят исследования
-
-Высокоэнтропийный трафик сам по себе не является нераспознаваемым: encrypted traffic можно классифицировать по размерам пакетов, timing и другим признакам потока.
-
-Наиболее известный исследованный механизм GFW для блокировки fully-encrypted traffic работал с TCP; случайный UDP этим механизмом не блокировался, что подтверждается исследованиями USENIX 2023, 2025.  Более новые работы показывают, что GFW умеет stateful-анализ UDP и QUIC, но об использовании произвольного анализа opaque-UDP в настоящее время не известно.
-Для selective blocking цензору приходится опираться на метаданные потока, репутацию IP, статистическую классификацию или более грубую политику фильтрации.
 
 ## Криптография
 
@@ -83,7 +82,7 @@ Noise используется только для аутентификации 
 
 ## `K_route`
 
-Помимо Noise identities обе стороны используют общий 32-байтный секрет `K_route`.
+Помимо Noise identities сервер и его клиенты используют общий 32-байтный секрет `K_route`.
 
 Это не ключ шифрования трафика и не Noise PSK.
 
@@ -96,7 +95,7 @@ Noise используется только для аутентификации 
 
 Mask привязан к конкретному пакету, поэтому одинаковые внутренние значения не дают одинакового представления на проводе.
 
-Сам по себе `K_route` не позволяет расшифровать DATA и не раскрывает Noise private keys. Компрометация `K_route`  не ломает криптографическую защиту туннеля, но делает протокол открытым для DPI. Это осознанно: если цензор знает k_route - он знает IP. В этом случае анализ уже не требуется: намного дешевле блокировать IP.
+Сам по себе `K_route` не позволяет расшифровать DATA и не раскрывает Noise private keys. Компрометация `K_route` не ломает криптографическую защиту туннеля, но снимает wire-masking для этого deployment. В обычной модели развёртывания `K_route` выдаётся вместе с endpoint сервера, поэтому компрометация клиентской конфигурации обычно раскрывает и то, и другое. В этом случае анализ уже не требуется: намного дешевле блокировать IP.
 
 ## Handshake
 

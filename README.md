@@ -4,13 +4,11 @@
 
 [Usage scripts](USAGE.md)
 
-Noranite is an anti-censorship L3 tunnel over UDP with no recognizable wire format.
+Noranite is an anti-censorship L3 tunnel over UDP designed without exposed protocol framing.
 
-The protocol is designed around the absence of protocol fingerprints as an architectural property. **Every packet, from the first byte to the last, looks like high-entropy binary noise.**
+**The Noranite UDP payload is random-looking from the first byte onward.** There are no exposed magic bytes, protocol version, packet type, session ID, sequence number, or recognizable handshake header.
 
-There are no exposed magic bytes, protocol version, packet type, session ID, sequence number, or recognizable handshake header.
-
-Noranite does not disguise itself as QUIC, DNS, HTTPS, or another allowed protocol. It solves a simpler problem: **it has no fixed signature of its own**, so selectively blocking the protocol requires collateral damage that is difficult to keep acceptable.
+Noranite does not disguise itself as QUIC, DNS, HTTPS, or another allowed protocol. Instead, it avoids fixed content signatures of its own. A censor that wants to identify it selectively must therefore rely on endpoint information, flow-level behavior, statistical classification, or broader filtering rather than a fixed byte signature.
 
 ## Core idea
 
@@ -45,20 +43,19 @@ DATA, control packets, and handshake traffic become distinguishable only after c
 
 ## Why "binary noise" matters
 
-The point is not randomness for its own sake. The point is to deny DPI a cheap, precise signature. If a protocol identifies itself on the wire, it can be blocked with little collateral damage. If the packet payload is indistinguishable from ordinary encrypted UDP, the censor is left with either expensive behavioral analysis based on timing, sizes, and flow structure, or coarse blocking of a broad class of UDP traffic together with HTTP/3/QUIC, WebRTC, real-time media, games, VPNs, and application-specific protocols.
+The point is not randomness for its own sake. The point is to remove a cheap, precise content signature. A fixed magic value, clear-text type field, or recognizable handshake gives content-based DPI a direct rule to match. Noranite deliberately provides no such rule.
 
-All an outside observer gets is a picture of "some strange traffic". A large share of Internet UDP traffic fits that description.
-The less a protocol reveals about itself on the wire, the more computation, false positives, and collateral damage are required to block it.
-Behavioral traffic analysis is still possible, but Noranite is an L3 tunnel: multiplexing and packet-size blurring significantly complicate that class of analysis as well (USENIX Security 2024).
+This design belongs to the family of fully encrypted, or "looks like random", transports studied in [*How the Great Firewall of China Detects and Blocks Fully Encrypted Traffic* (USENIX Security 2023)](https://www.usenix.org/conference/usenixsecurity23/presentation/wu-mingshi). That work is also a useful warning: random-looking traffic is not automatically unclassifiable. The GFW mechanism characterized there used heuristics over the first TCP payload rather than a protocol-specific signature.
 
-Noranite does not make blocking impossible. It makes precise blocking **messy and very expensive**.
+For the mechanism measured in that 2023 study, UDP was not affected: a UDP datagram with a random payload did not trigger blocking. That is an observation about a particular deployed censorship system, not a general property of UDP. [*Exposing and Circumventing SNI-based QUIC Censorship of the Great Firewall of China* (USENIX Security 2025)](https://www.usenix.org/conference/usenixsecurity25/presentation/zohaib) later showed that the GFW performs stateful analysis of QUIC over UDP, including decrypting QUIC Initial packets and applying protocol-specific rules.
 
-## What the research says
+Without a fixed content signature, a censor can still use endpoint information, packet sizes, timing, direction, burst structure, traffic volume, or statistical classification. Noranite does not try to eliminate those signals.
 
-High-entropy traffic is not automatically unclassifiable: encrypted traffic can still be classified by packet sizes, timing, and other flow-level features.
+Noranite is an L3 tunnel, so unrelated application flows are naturally multiplexed into one outer UDP flow. That interleaving disturbs packet-size, timing, and direction patterns; DATA also adds 0..15 bytes of random authenticated padding. [*Fingerprinting Obfuscated Proxy Traffic with Encapsulated TLS Handshakes* (USENIX Security 2024)](https://www.usenix.org/conference/usenixsecurity24/presentation/xue-fingerprinting) found stream multiplexing to be a viable mitigation against this class of traffic analysis, while also showing that multiplexing and random padding alone do not eliminate flow-level fingerprints.
 
-The best-known studied GFW mechanism for blocking fully encrypted traffic operated on TCP; random UDP was not blocked by that mechanism, as reported in USENIX studies from 2023 and 2025. More recent work shows that the GFW can perform stateful analysis of UDP and QUIC, but there is currently no public evidence of arbitrary opaque-UDP analysis being used as a general blocking mechanism.
-For selective blocking, a censor therefore has to fall back to flow metadata, IP reputation, statistical classification, or broader filtering policy.
+The broader trade-off is studied from another angle in [*Censorship Evasion with Unidentified Protocol Generation* (USENIX Security 2025)](https://www.usenix.org/conference/usenixsecurity25/presentation/wails): when an encrypted protocol cannot be identified precisely at the protocol level, blocking unidentified traffic risks collateral damage to other encrypted protocols.
+
+Noranite does not prevent blocking. It removes the cheap case: a fixed protocol signature. Selective identification must instead rely on endpoint information, flow-level analysis, or broader filtering policy.
 
 ## Cryptography
 
@@ -83,7 +80,7 @@ Noise is used only for authentication and key derivation. The Noranite wire form
 
 ## `K_route`
 
-In addition to Noise identities, both sides share a 32-byte secret called `K_route`.
+In addition to Noise identities, a server deployment and its clients share a 32-byte secret called `K_route`.
 
 It is not a traffic-encryption key and it is not a Noise PSK.
 
@@ -96,7 +93,7 @@ It is used to mask:
 
 The mask is bound to the individual packet, so identical internal values do not produce identical bytes on the wire.
 
-Knowing `K_route` alone does not allow an attacker to decrypt DATA or recover Noise private keys. Compromising `K_route` does not break the tunnel's cryptographic confidentiality or authentication, but it does expose the protocol to DPI. This is intentional: if a censor knows `K_route`, it already knows the endpoint IP. At that point traffic analysis is unnecessary; blocking the IP is cheaper.
+Knowing `K_route` alone does not allow an attacker to decrypt DATA or recover Noise private keys. Compromising `K_route` does not break the tunnel's cryptographic confidentiality or authentication, but it removes the wire-masking layer for that deployment. In the normal deployment model, `K_route` is provisioned together with the server endpoint, so compromise of a client configuration normally reveals both. At that point traffic analysis is unnecessary; blocking the IP is cheaper.
 
 ## Handshake
 
@@ -160,9 +157,9 @@ accepted packet
 
 Forging an opaque route value is not useful by itself: the real session ID is not an authentication mechanism.
 
-## Why this security model is trustworthy
+## Cryptographic security model
 
-Noranite's core security does not depend on obfuscation.
+Traffic confidentiality and authentication do not depend on wire-format masking.
 
 Even if wire masking is treated as completely compromised, traffic protection still rests on standard cryptographic primitives:
 
