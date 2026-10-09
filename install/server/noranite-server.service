@@ -1,0 +1,21 @@
+[Unit]
+Description=Noranite VPN server
+Wants=network-online.target
+After=network-online.target noranite-server-network.service
+Requires=noranite-server-network.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/noranite/server.env
+RuntimeDirectory=noranite
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=no
+ExecStart=/usr/local/bin/opaque-server -tun nrnt0 -mtu ${NRNT_MTU} -bind ${NRNT_BIND} -route-key-file /etc/noranite/route.key -private-key-file /etc/noranite/server.private -peers-file /etc/noranite/server.peers -control-socket /run/noranite/control.sock
+ExecStartPost=/usr/local/libexec/noranite/server-network tun-up
+Restart=on-failure
+RestartSec=1s
+TimeoutStartSec=10s
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target

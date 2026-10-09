@@ -17,6 +17,8 @@ fi
 
 go build "${build_flags[@]}" -o "${BIN_DIR}/opaque-server" ./cmd/opaque-server
 go build "${build_flags[@]}" -o "${BIN_DIR}/opaque-client" ./cmd/opaque-client
+go build -o "${BIN_DIR}/noranitectl" ./cmd/noranitectl
+go build -o "${BIN_DIR}/noranite-peer" ./cmd/noranite-peer
 go build "${build_flags[@]}" -o "${BIN_DIR}/opaque-live-proxy" ./test/live/udp-proxy
 go build -o "${BIN_DIR}/opaque-keygen" ./cmd/opaque-keygen
 go build -o "${BIN_DIR}/opaque-trafficgen" ./test/traffic/trafficgen
@@ -24,6 +26,8 @@ go build -o "${BIN_DIR}/opaque-trafficgen" ./test/traffic/trafficgen
 echo "built:"
 echo "  ${BIN_DIR}/opaque-server"
 echo "  ${BIN_DIR}/opaque-client"
+echo "  ${BIN_DIR}/noranitectl"
+echo "  ${BIN_DIR}/noranite-peer"
 echo "  ${BIN_DIR}/opaque-live-proxy"
 echo "  ${BIN_DIR}/opaque-keygen"
 echo "  ${BIN_DIR}/opaque-trafficgen"

@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+REPOSITORY="noranite/Noranite-l3"
+REF="${NORANITE_REF:-main}"
+CONFIG_FILE="/etc/noranite/server.env"
+
+TUNNEL_ADDRESS="${NORANITE_TUNNEL_ADDRESS:-10.66.0.1/16}"
+UDP_PORT="${NORANITE_PORT:-51820}"
+MTU="${NORANITE_MTU:-1380}"
+LOCAL_ACCESS="${NORANITE_LOCAL_ACCESS:-deny}"
+EGRESS_IFACE="${NORANITE_EGRESS_IFACE:-}"
+NONINTERACTIVE="${NORANITE_NONINTERACTIVE:-0}"
+
+TMP_DIR=""
+
+fail() {
+	echo "error: $*" >&2
+	exit 1
+}
+
+cleanup() {
+	if [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]]; then
+		rm -rf -- "${TMP_DIR}"
+	fi
+}
+trap cleanup EXIT
+
+prompt_default() {
+	local variable_name="$1"
+	local label="$2"
+	local default_value="$3"
+	local answer=""
+
+	if [[ ! -r /dev/tty ]]; then
+		fail "interactive terminal is required for first install; set NORANITE_NONINTERACTIVE=1 to use environment/default values"
+	fi
+	read -r -p "${label} [${default_value}]: " answer </dev/tty
+	printf -v "${variable_name}" '%s' "${answer:-${default_value}}"
+}
+
+prompt_local_access() {
+	local answer=""
+	local prompt="Allow VPN clients to access the server/LAN? [y/N]: "
+	if [[ "${LOCAL_ACCESS}" == "allow" ]]; then
+		prompt="Allow VPN clients to access the server/LAN? [Y/n]: "
+	fi
+
+	if [[ ! -r /dev/tty ]]; then
+		return
+	fi
+	read -r -p "${prompt}" answer </dev/tty
+	case "${answer}" in
+		y|Y|yes|YES) LOCAL_ACCESS="allow" ;;
+		n|N|no|NO) LOCAL_ACCESS="deny" ;;
+		"") ;;
+		*) fail "expected yes or no" ;;
+	esac
+}
+
+install_dependencies_if_needed() {
+	local missing=()
+	local command_name
+
+	for command_name in curl tar ip iptables sysctl awk head base64 tr install uname mktemp; do
+		if ! command -v "${command_name}" >/dev/null 2>&1; then
+			missing+=("${command_name}")
+		fi
+	done
+	if ((${#missing[@]} == 0)); then
+		return
+	fi
+
+	if ! command -v apt-get >/dev/null 2>&1; then
+		fail "missing required commands: ${missing[*]}; automatic dependency installation currently supports Debian/Ubuntu only"
+	fi
+
+	echo "Installing required system packages..."
+	export DEBIAN_FRONTEND=noninteractive
+	apt-get update
+	apt-get install -y ca-certificates curl tar gzip iproute2 iptables procps coreutils mawk
+
+	for command_name in curl tar ip iptables sysctl awk head base64 tr install uname mktemp; do
+		command -v "${command_name}" >/dev/null 2>&1 || fail "required command is still missing after package installation: ${command_name}"
+	done
+}
+
+version_ge() {
+	local have="$1" required="$2"
+	local h1=0 h2=0 h3=0 r1=0 r2=0 r3=0
+	IFS=. read -r h1 h2 h3 <<<"${have}"
+	IFS=. read -r r1 r2 r3 <<<"${required}"
+	h3="${h3:-0}"
+	r3="${r3:-0}"
+	(( h1 > r1 || (h1 == r1 && h2 > r2) || (h1 == r1 && h2 == r2 && h3 >= r3) ))
+}
+
+select_go() {
+	local source_dir="$1"
+	local required_version installed_version="" go_arch go_archive
+	local installed_go=""
+
+	required_version="$(awk '$1 == "go" {print $2; exit}' "${source_dir}/go.mod")"
+	[[ -n "${required_version}" ]] || fail "could not determine required Go version from go.mod"
+
+	if command -v go >/dev/null 2>&1; then
+		installed_go="$(command -v go)"
+		installed_version="$(${installed_go} env GOVERSION 2>/dev/null || true)"
+		installed_version="${installed_version#go}"
+		if [[ "${installed_version}" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] && version_ge "${installed_version}" "${required_version}"; then
+			echo "Using installed Go ${installed_version}"
+			GO_BIN="${installed_go}"
+			return
+		fi
+	fi
+
+	case "$(uname -m)" in
+		x86_64|amd64) go_arch="amd64" ;;
+		aarch64|arm64) go_arch="arm64" ;;
+		*) fail "unsupported CPU architecture: $(uname -m)" ;;
+	esac
+
+	echo "Downloading temporary Go ${required_version} toolchain..."
+	go_archive="${TMP_DIR}/go.tar.gz"
+	curl -fL --retry 3 --retry-delay 1 \
+		"https://go.dev/dl/go${required_version}.linux-${go_arch}.tar.gz" \
+		-o "${go_archive}"
+	tar -xzf "${go_archive}" -C "${TMP_DIR}"
+	GO_BIN="${TMP_DIR}/go/bin/go"
+	[[ -x "${GO_BIN}" ]] || fail "downloaded Go toolchain is incomplete"
+}
+
+validate_first_install_options() {
+	[[ "${TUNNEL_ADDRESS}" == */16 ]] || fail "tunnel address must use /16 (example: 10.66.0.1/16)"
+	[[ "${UDP_PORT}" =~ ^[0-9]+$ ]] || fail "UDP port must be numeric"
+	(( UDP_PORT >= 1 && UDP_PORT <= 65535 )) || fail "UDP port must be between 1 and 65535"
+	[[ "${MTU}" =~ ^[0-9]+$ ]] || fail "MTU must be numeric"
+	(( MTU >= 576 && MTU <= 65535 )) || fail "MTU is outside a sensible IPv4 range"
+	case "${LOCAL_ACCESS}" in
+		deny|allow) ;;
+		*) fail "local access must be deny or allow" ;;
+	esac
+	ip link show dev "${EGRESS_IFACE}" >/dev/null 2>&1 || fail "network interface does not exist: ${EGRESS_IFACE}"
+}
+
+if (( EUID != 0 )); then
+	fail "run this bootstrap as root (for example: curl ... | sudo bash)"
+fi
+
+install_dependencies_if_needed
+
+command -v systemctl >/dev/null 2>&1 || fail "systemctl is required; this installer targets systemd-based Linux servers"
+if [[ ! -d /run/systemd/system ]]; then
+	fail "systemd is not running; this installer currently targets systemd-based Linux servers"
+fi
+
+if [[ ! -e "${CONFIG_FILE}" ]]; then
+	if [[ -z "${EGRESS_IFACE}" ]]; then
+		EGRESS_IFACE="$(ip -4 route show default | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')"
+	fi
+	[[ -n "${EGRESS_IFACE}" ]] || fail "could not auto-detect the Internet-facing interface"
+
+	if [[ "${NONINTERACTIVE}" == "1" ]]; then
+		echo "Noranite server setup (non-interactive)"
+	else
+		echo "Noranite server setup"
+		echo "Press Enter to accept a default value."
+		prompt_default EGRESS_IFACE "Internet-facing interface" "${EGRESS_IFACE}"
+		prompt_default TUNNEL_ADDRESS "Tunnel address" "${TUNNEL_ADDRESS}"
+		prompt_default UDP_PORT "UDP listen port" "${UDP_PORT}"
+		prompt_default MTU "Tunnel MTU" "${MTU}"
+		prompt_local_access
+	fi
+	validate_first_install_options
+else
+	echo "Existing ${CONFIG_FILE} detected; network settings and keys will be preserved."
+fi
+
+TMP_DIR="$(mktemp -d -t noranite-install.XXXXXXXX)"
+SOURCE_DIR="${TMP_DIR}/src"
+mkdir -p "${SOURCE_DIR}"
+
+echo "Downloading ${REPOSITORY}@${REF}..."
+curl -fL --retry 3 --retry-delay 1 \
+	"https://github.com/${REPOSITORY}/archive/${REF}.tar.gz" \
+	-o "${TMP_DIR}/source.tar.gz"
+tar -xzf "${TMP_DIR}/source.tar.gz" --strip-components=1 -C "${SOURCE_DIR}"
+
+[[ -f "${SOURCE_DIR}/install/server/install.sh" ]] || fail "${REPOSITORY}@${REF} does not contain install/server/install.sh"
+[[ -f "${SOURCE_DIR}/go.mod" ]] || fail "downloaded source does not contain go.mod"
+
+GO_BIN=""
+select_go "${SOURCE_DIR}"
+
+mkdir -p "${SOURCE_DIR}/bin"
+echo "Building Noranite..."
+(
+	cd "${SOURCE_DIR}"
+	CGO_ENABLED=0 "${GO_BIN}" build -trimpath -o bin/opaque-server ./cmd/opaque-server
+	CGO_ENABLED=0 "${GO_BIN}" build -trimpath -o bin/noranitectl ./cmd/noranitectl
+	CGO_ENABLED=0 "${GO_BIN}" build -trimpath -o bin/noranite-peer ./cmd/noranite-peer
+	CGO_ENABLED=0 "${GO_BIN}" build -trimpath -o bin/opaque-keygen ./cmd/opaque-keygen
+)
+
+install_args=(--bin-dir "${SOURCE_DIR}/bin")
+if [[ ! -e "${CONFIG_FILE}" ]]; then
+	install_args+=(
+		--egress-interface "${EGRESS_IFACE}"
+		--tunnel-address "${TUNNEL_ADDRESS}"
+		--bind "0.0.0.0:${UDP_PORT}"
+		--mtu "${MTU}"
+		--local-access "${LOCAL_ACCESS}"
+	)
+fi
+
+bash "${SOURCE_DIR}/install/server/install.sh" "${install_args[@]}"
+
+echo
+echo "Installation complete."
+echo "  status:     systemctl status noranite-server"
+echo "  logs:       journalctl -u noranite-server -f"
+echo "  peers:      noranitectl peer list"
+if [[ -r /etc/noranite/server.public ]]; then
+	echo "  public key: $(tr -d '\r\n' </etc/noranite/server.public)"
+fi

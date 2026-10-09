@@ -117,10 +117,11 @@ type RXEngine struct {
 	consume RXConsumeFunc
 	report  EngineErrorFunc
 
-	batchSize int
+	batchSize     int
+	peerQueueSize int
 
 	decryptQueue  chan *rxContainer
-	peerQueues    map[*Peer]chan *rxContainer
+	peerQueues    map[*Peer]chan *rxContainer // present+nil means registered but not activated
 	deliveryQueue chan *rxContainer
 
 	elementPool   sync.Pool
@@ -192,6 +193,7 @@ func newRXEngine(
 		consume:          consume,
 		report:           report,
 		batchSize:        config.BatchSize,
+		peerQueueSize:    config.PeerQueueSize,
 		decryptQueue:     make(chan *rxContainer, config.DecryptQueueSize),
 		peerQueues:       make(map[*Peer]chan *rxContainer, len(core.peersByTunnelIPv4)),
 		submitSeen:       make(map[*InboundOperation]struct{}),
@@ -209,7 +211,9 @@ func newRXEngine(
 		if _, exists := engine.peerQueues[peer]; exists {
 			continue
 		}
-		engine.peerQueues[peer] = make(chan *rxContainer, config.PeerQueueSize)
+		// A nil queue means the Peer is registered with this engine but has not
+		// carried traffic yet. The ordered lane is allocated on first submission.
+		engine.peerQueues[peer] = nil
 	}
 	engine.submitContainerOrder = make([]*rxContainer, 0, min(config.BatchSize, len(engine.peerQueues)))
 	engine.elementPool.New = func() any {
@@ -219,10 +223,6 @@ func newRXEngine(
 		return new(rxContainer)
 	}
 
-	for peer, queue := range engine.peerQueues {
-		engine.workers.Add(1)
-		go engine.routineSequentialReceiver(peer, queue)
-	}
 	for i, scratch := range scratches {
 		engine.workers.Add(1)
 		go engine.routineDecryption(i, scratch)
@@ -281,6 +281,7 @@ func (e *RXEngine) EnqueueBatch(
 	results := make([]<-chan RXResult, len(ops))
 	for i, op := range ops {
 		peer := op.binding.peer
+		e.ensurePeerQueueLocked(peer)
 		container := e.submitContainers[peer]
 		if container == nil {
 			container = e.getContainer(peer, false)
@@ -339,7 +340,7 @@ func (e *RXEngine) EnqueueOwnedBatch(
 		if op.binding.peer == nil || op.admission.Session == nil {
 			return fmt.Errorf("invalid owned inbound operation %d: %w", i, dataplane.ErrInvalidConfig)
 		}
-		if _, exists := e.peerQueues[op.binding.peer]; !exists {
+		if _, exists := e.peerQueues[op.binding.peer]; !exists && !op.binding.peer.IsRevoked() {
 			return fmt.Errorf("owned inbound operation %d belongs to unknown engine peer: %w", i, dataplane.ErrInvalidConfig)
 		}
 		if len(op.packet) == 0 {
@@ -350,6 +351,11 @@ func (e *RXEngine) EnqueueOwnedBatch(
 	for i := range submissions {
 		op := &submissions[i].Operation
 		peer := op.binding.peer
+		if _, registered := e.peerQueues[peer]; !registered {
+			releaser.Put(op.packet)
+			continue
+		}
+		e.ensurePeerQueueLocked(peer)
 		container := e.submitContainers[peer]
 		if container == nil {
 			container = e.getContainer(peer, true)
@@ -367,6 +373,58 @@ func (e *RXEngine) EnqueueOwnedBatch(
 
 	e.publishSubmittedContainers()
 	return nil
+}
+
+// AddPeer registers a Peer before it becomes visible in Core. Its ordered
+// queue and worker are created lazily on the first accepted submission.
+func (e *RXEngine) AddPeer(peer *Peer) error {
+	if peer == nil {
+		return dataplane.ErrInvalidConfig
+	}
+	e.submitMu.Lock()
+	defer e.submitMu.Unlock()
+	if e.closed {
+		return ErrRXEngineClosed
+	}
+	if _, exists := e.peerQueues[peer]; exists {
+		return dataplane.ErrInvalidConfig
+	}
+	e.peerQueues[peer] = nil
+	return nil
+}
+
+// ensurePeerQueueLocked activates the per-Peer ordered lane. submitMu must be
+// held by the caller, which serializes activation with RetirePeer and Close.
+func (e *RXEngine) ensurePeerQueueLocked(peer *Peer) chan *rxContainer {
+	queue, registered := e.peerQueues[peer]
+	if !registered {
+		return nil
+	}
+	if queue != nil {
+		return queue
+	}
+	queue = make(chan *rxContainer, e.peerQueueSize)
+	e.peerQueues[peer] = queue
+	e.workers.Add(1)
+	go e.routineSequentialReceiver(peer, queue)
+	return queue
+}
+
+// RetirePeer prevents new submissions and drains previously accepted work.
+func (e *RXEngine) RetirePeer(peer *Peer) {
+	e.submitMu.Lock()
+	defer e.submitMu.Unlock()
+	// Close may already have closed every queue without removing the entries.
+	// Never close a channel a second time during daemon shutdown.
+	if e.closed {
+		return
+	}
+	if queue, exists := e.peerQueues[peer]; exists {
+		delete(e.peerQueues, peer)
+		if queue != nil {
+			close(queue)
+		}
+	}
 }
 
 func (e *RXEngine) publishSubmittedContainers() {
@@ -398,8 +456,11 @@ func (e *RXEngine) Close() {
 	e.closed = true
 	close(e.decryptQueue)
 	for _, queue := range e.peerQueues {
-		close(queue)
+		if queue != nil {
+			close(queue)
+		}
 	}
+	clear(e.peerQueues)
 	e.submitMu.Unlock()
 
 	e.workers.Wait()

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/noranite/Noranite-l3/internal/dataplane"
@@ -83,7 +84,8 @@ type pendingInstallResult struct {
 // Peer owns Session generation placement for one configured client.
 // Deadlines are admission deadlines, not cancellation deadlines.
 type Peer struct {
-	mu sync.RWMutex
+	mu      sync.RWMutex
+	revoked atomic.Bool
 
 	// Compatibility serialization for direct/synchronous callers only.
 	rxCompatMu sync.Mutex
@@ -124,6 +126,9 @@ func newPeerAt(
 func (p *Peer) LookupRX(sessionID uint64, receivedAt time.Time) *dataplane.Session {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+	if p.revoked.Load() {
+		return nil
+	}
 
 	if slotRXEligible(p.pending, sessionID, receivedAt) {
 		return p.pending.session
@@ -154,6 +159,9 @@ func (p *Peer) AdmitRX(
 
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+	if p.revoked.Load() {
+		return RXAdmission{}, ErrPeerRevoked
+	}
 
 	if p.pending.session == candidate && receivedAt.Before(p.pending.rejectAt) {
 		return RXAdmission{Session: candidate, MayPromote: true}, nil
@@ -193,6 +201,9 @@ func (p *Peer) installPending(
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.revoked.Load() {
+		return pendingInstallResult{}, ErrPeerRevoked
+	}
 
 	expiredPending, expiredPrevious := p.dropExpiredLocked(now)
 
@@ -258,6 +269,9 @@ func (p *Peer) commitAuthenticatedRXOwned(
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.revoked.Load() {
+		return RXCommitResult{}, ErrPeerRevoked
+	}
 
 	if p.pending.session != candidate {
 		// Another packet may already have promoted candidate. In that case a
@@ -289,6 +303,18 @@ func (p *Peer) commitAuthenticatedRXOwned(
 	}, nil
 }
 
+func (p *Peer) IsRevoked() bool { return p.revoked.Load() }
+
+func (p *Peer) revoke() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.revoked.Store(true)
+	p.pending = sessionSlot{}
+	p.current = sessionSlot{}
+	p.previous = sessionSlot{}
+	p.previousUntil = time.Time{}
+}
+
 func (p *Peer) hasSession(candidate *dataplane.Session) bool {
 	if candidate == nil {
 		return false
@@ -306,6 +332,9 @@ func (p *Peer) hasSession(candidate *dataplane.Session) bool {
 func (p *Peer) AdmitCurrentData(now time.Time) (TXDataAdmission, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+	if p.revoked.Load() {
+		return TXDataAdmission{}, ErrPeerRevoked
+	}
 
 	current := p.current
 	if current.session == nil {

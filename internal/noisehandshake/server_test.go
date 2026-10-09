@@ -313,6 +313,7 @@ func TestNoiseServerFinalFreshnessRecheckRejectsOlderCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	peer := provider.peers[clientPublic]
+	binding := peer.binding.Load()
 
 	newerSession, err := dataplane.NewSession(11, [32]byte{1}, [32]byte{2}, 0)
 	if err != nil {
@@ -325,11 +326,11 @@ func TestNoiseServerFinalFreshnessRecheckRejectsOlderCompletion(t *testing.T) {
 	newer := testFreshness(11, 0)
 	older := testFreshness(10, 0)
 
-	installed, err := provider.commitFreshPending(peer, newer, newerSession)
+	installed, err := provider.commitFreshPending(peer, binding, newer, newerSession)
 	if err != nil || !installed {
 		t.Fatalf("commit newer installed=%v err=%v", installed, err)
 	}
-	installed, err = provider.commitFreshPending(peer, older, olderSession)
+	installed, err = provider.commitFreshPending(peer, binding, older, olderSession)
 	if err != nil {
 		t.Fatalf("commit older: %v", err)
 	}
@@ -670,4 +671,92 @@ func (r *concurrencyDetectReader) Read(p []byte) (int, error) {
 	}
 	r.active.Add(-1)
 	return len(p), nil
+}
+
+func TestReplaceAuthorizedPeerPreservesFreshnessAndRejectsOldBinding(t *testing.T) {
+	serverPrivate := testPrivateKey(33)
+	clientPrivate := testPrivateKey(1)
+	clientPublic, _ := PublicKeyFromPrivate(clientPrivate)
+	oldIP := netip.MustParseAddr("10.66.0.2")
+	newIP := netip.MustParseAddr("10.66.0.3")
+	core := newNoiseTestCore(t, [32]byte{}, oldIP)
+	provider, err := NewServer(ServerConfig{
+		Core:             core,
+		StaticPrivateKey: serverPrivate,
+		Peers:            []AuthorizedPeer{{TunnelIPv4: oldIP, PublicKey: clientPublic}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	state := provider.peers[clientPublic]
+	oldBinding := state.binding.Load()
+	state.hasLatest = true
+	state.latestFreshness = Freshness(100)
+
+	replacement, err := core.PreparePeer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.PublishPeer(newIP, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.ReplaceAuthorizedPeer(clientPublic, oldBinding.corePeer, newIP, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if provider.peers[clientPublic] != state {
+		t.Fatal("replacement changed stable peer state")
+	}
+	if state.latestFreshness != Freshness(100) {
+		t.Fatalf("freshness=%d, want 100", state.latestFreshness)
+	}
+	newBinding := state.binding.Load()
+	if newBinding == oldBinding || newBinding.tunnelIPv4 != newIP || newBinding.corePeer != replacement {
+		t.Fatalf("unexpected replacement binding: %#v", newBinding)
+	}
+
+	session, err := dataplane.NewSession(99, [32]byte{1}, [32]byte{2}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installed, err := provider.commitFreshPending(state, oldBinding, Freshness(101), session)
+	if !errors.Is(err, coreserver.ErrPeerRevoked) || installed {
+		t.Fatalf("old binding commit installed=%v err=%v", installed, err)
+	}
+}
+
+func TestRemoveAuthorizedPeerInvalidatesPinnedBinding(t *testing.T) {
+	serverPrivate := testPrivateKey(33)
+	clientPrivate := testPrivateKey(1)
+	clientPublic, _ := PublicKeyFromPrivate(clientPrivate)
+	ip := netip.MustParseAddr("10.66.0.2")
+	core := newNoiseTestCore(t, [32]byte{}, ip)
+	provider, err := NewServer(ServerConfig{
+		Core:             core,
+		StaticPrivateKey: serverPrivate,
+		Peers:            []AuthorizedPeer{{TunnelIPv4: ip, PublicKey: clientPublic}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	state := provider.peers[clientPublic]
+	oldBinding := state.binding.Load()
+	provider.RemoveAuthorizedPeer(clientPublic)
+
+	if _, exists := provider.peers[clientPublic]; exists {
+		t.Fatal("removed peer remains authorized")
+	}
+	if binding := state.binding.Load(); binding != nil {
+		t.Fatalf("removed peer binding=%#v, want nil", binding)
+	}
+
+	session, err := dataplane.NewSession(99, [32]byte{1}, [32]byte{2}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installed, err := provider.commitFreshPending(state, oldBinding, Freshness(1), session)
+	if !errors.Is(err, coreserver.ErrPeerRevoked) || installed {
+		t.Fatalf("removed binding commit installed=%v err=%v", installed, err)
+	}
 }

@@ -16,7 +16,7 @@ func TestLoadPeerSpecs(t *testing.T) {
 	}
 	path := filepath.Join(t.TempDir(), "peers.txt")
 	contents := "# test peers\n" +
-		"10.66.0.2 " + base64.StdEncoding.EncodeToString(keyA) + "\n" +
+		"10.66.0.2 " + base64.StdEncoding.EncodeToString(keyA) + " alice-laptop\n" +
 		"10.66.0.3 " + base64.StdEncoding.EncodeToString(keyB) + " # peer b\n"
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
@@ -29,10 +29,13 @@ func TestLoadPeerSpecs(t *testing.T) {
 	if len(specs) != 2 {
 		t.Fatalf("peer count=%d, want 2", len(specs))
 	}
-	if got := specs[0].tunnelIPv4.String(); got != "10.66.0.2" {
+	if got := specs[0].TunnelIPv4.String(); got != "10.66.0.2" {
 		t.Fatalf("first tunnel IPv4=%s", got)
 	}
-	if got := specs[1].tunnelIPv4.String(); got != "10.66.0.3" {
+	if specs[0].Name != "alice-laptop" {
+		t.Fatalf("first peer name=%q", specs[0].Name)
+	}
+	if got := specs[1].TunnelIPv4.String(); got != "10.66.0.3" {
 		t.Fatalf("second tunnel IPv4=%s", got)
 	}
 }
@@ -69,5 +72,28 @@ func TestLoadPeerSpecsRejectsDuplicates(t *testing.T) {
 				t.Fatal("loadPeerSpecs unexpectedly succeeded")
 			}
 		})
+	}
+}
+
+func TestLoadPeerSpecsRejectsInvalidTunnelAddress(t *testing.T) {
+	key := make([]byte, 32)
+	key[0] = 1
+	path := filepath.Join(t.TempDir(), "peers.txt")
+	contents := "127.0.0.2 " + base64.StdEncoding.EncodeToString(key) + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadPeerSpecs(path); err == nil {
+		t.Fatal("loadPeerSpecs unexpectedly accepted loopback tunnel address")
+	}
+}
+
+func TestLoadPeerSpecsEmptyPathMeansNoBootstrapPeers(t *testing.T) {
+	specs, err := loadPeerSpecs("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(specs) != 0 {
+		t.Fatalf("peer count=%d, want 0", len(specs))
 	}
 }

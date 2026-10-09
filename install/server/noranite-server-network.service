@@ -1,0 +1,14 @@
+[Unit]
+Description=Noranite server gateway networking
+Wants=network-online.target
+After=network-online.target
+Before=noranite-server.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/noranite/server-network up
+ExecStop=/usr/local/libexec/noranite/server-network down
+
+[Install]
+WantedBy=multi-user.target

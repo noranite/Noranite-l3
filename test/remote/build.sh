@@ -15,6 +15,8 @@ fi
 echo "building Opaque remote-test binaries..."
 go build "${build_flags[@]}" -o "${BIN_DIR}/opaque-server" ./cmd/opaque-server
 go build "${build_flags[@]}" -o "${BIN_DIR}/opaque-client" ./cmd/opaque-client
+go build -o "${BIN_DIR}/noranitectl" ./cmd/noranitectl
+go build -o "${BIN_DIR}/noranite-peer" ./cmd/noranite-peer
 go build "${build_flags[@]}" -o "${BIN_DIR}/opaque-live-proxy" ./test/live/udp-proxy
 go build -o "${BIN_DIR}/opaque-keygen" ./cmd/opaque-keygen
 go build -o "${BIN_DIR}/opaque-trafficgen" ./test/traffic/trafficgen

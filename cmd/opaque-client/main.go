@@ -24,7 +24,7 @@ import (
 func main() {
 	tunName := flag.String(
 		"tun",
-		"ol3c0",
+		"nrnt0",
 		"TUN interface name",
 	)
 

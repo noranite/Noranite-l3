@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 
 	"github.com/noranite/Noranite-l3/internal/dataplane"
 	"github.com/noranite/Noranite-l3/internal/establishment"
@@ -40,8 +41,13 @@ type ServerConfig struct {
 	Random io.Reader
 }
 
-type serverPeerState struct {
+type serverPeerBinding struct {
 	tunnelIPv4 netip.Addr
+	corePeer   *coreserver.Peer
+}
+
+type serverPeerState struct {
+	binding atomic.Pointer[serverPeerBinding]
 
 	// mu protects the establishment ordering transaction only. Noise crypto and
 	// RNG must never execute while this mutex is held.
@@ -70,6 +76,7 @@ type Server struct {
 	random           *lockedReader
 	routeMu          sync.Mutex
 	routeScratch     *dataplane.DataScratch
+	peersMu          sync.RWMutex
 	peers            map[PublicKey]*serverPeerState
 }
 
@@ -77,10 +84,6 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if config.Core == nil {
 		return nil, fmt.Errorf("server core is nil: %w", ErrInvalidState)
 	}
-	if len(config.Peers) == 0 {
-		return nil, fmt.Errorf("authorized peer list is empty: %w", ErrInvalidState)
-	}
-
 	if config.StaticPrivateKey == (PrivateKey{}) {
 		return nil, fmt.Errorf("server static private key is zero: %w", ErrInvalidKey)
 	}
@@ -104,8 +107,8 @@ func NewServer(config ServerConfig) (*Server, error) {
 	tunnels := make(map[netip.Addr]struct{}, len(config.Peers))
 	for i, peer := range config.Peers {
 		tunnelIPv4 := peer.TunnelIPv4.Unmap()
-		if !tunnelIPv4.IsValid() || !tunnelIPv4.Is4() {
-			return nil, fmt.Errorf("authorized peer %d tunnel address must be IPv4: %w", i, ErrInvalidState)
+		if err := coreserver.ValidateTunnelIPv4(tunnelIPv4); err != nil {
+			return nil, fmt.Errorf("authorized peer %d tunnel address: %w", i, ErrInvalidState)
 		}
 		if !config.Core.HasPeer(tunnelIPv4) {
 			return nil, fmt.Errorf("authorized peer %d tunnel IPv4 %s is not configured in server core: %w", i, tunnelIPv4, coreserver.ErrUnknownPeer)
@@ -124,7 +127,12 @@ func NewServer(config ServerConfig) (*Server, error) {
 			return nil, fmt.Errorf("authorized peer %d public key: %w", i, ErrInvalidKey)
 		}
 
-		peers[peer.PublicKey] = &serverPeerState{tunnelIPv4: tunnelIPv4}
+		state := &serverPeerState{}
+		state.binding.Store(&serverPeerBinding{
+			tunnelIPv4: tunnelIPv4,
+			corePeer:   config.Core.PeerForIP(tunnelIPv4),
+		})
+		peers[peer.PublicKey] = state
 		tunnels[tunnelIPv4] = struct{}{}
 	}
 
@@ -195,8 +203,14 @@ func (s *Server) TryHandleEstablishmentDatagramInPlace(
 		// A successful IK ReadMessage must expose the initiator static key.
 		return true, nil, netip.AddrPort{}, fmt.Errorf("read authenticated client static key: %w", err)
 	}
+	s.peersMu.RLock()
 	peer := s.peers[clientPublicKey]
+	s.peersMu.RUnlock()
 	if peer == nil {
+		return true, nil, netip.AddrPort{}, nil
+	}
+	binding := peer.binding.Load()
+	if binding == nil {
 		return true, nil, netip.AddrPort{}, nil
 	}
 
@@ -236,9 +250,9 @@ func (s *Server) TryHandleEstablishmentDatagramInPlace(
 		return true, nil, netip.AddrPort{}, fmt.Errorf("create server traffic session: %w", err)
 	}
 
-	installed, err := s.commitFreshPending(peer, freshness, session)
+	installed, err := s.commitFreshPending(peer, binding, freshness, session)
 	if err != nil {
-		if errors.Is(err, coreserver.ErrSessionIDCollision) {
+		if errors.Is(err, coreserver.ErrSessionIDCollision) || errors.Is(err, coreserver.ErrPeerRevoked) {
 			// Collision invalidates this whole exchange. Do not publish RESPONSE and
 			// do not advance freshness; a normal client retry gets a new exchange.
 			return true, nil, netip.AddrPort{}, nil
@@ -279,17 +293,25 @@ func (p *serverPeerState) preliminaryFresh(incoming Freshness) bool {
 // one critical section so older crypto completions cannot supersede newer ones.
 func (s *Server) commitFreshPending(
 	peer *serverPeerState,
+	expectedBinding *serverPeerBinding,
 	freshness Freshness,
 	session *dataplane.Session,
 ) (bool, error) {
 	peer.mu.Lock()
 	defer peer.mu.Unlock()
 
+	if peer.binding.Load() != expectedBinding {
+		return false, coreserver.ErrPeerRevoked
+	}
 	if peer.hasLatest && freshness <= peer.latestFreshness {
 		return false, nil
 	}
 
-	if err := s.core.InstallPendingSession(peer.tunnelIPv4, session); err != nil {
+	if err := s.core.InstallPendingSessionForPeer(
+		expectedBinding.tunnelIPv4,
+		expectedBinding.corePeer,
+		session,
+	); err != nil {
 		return false, err
 	}
 

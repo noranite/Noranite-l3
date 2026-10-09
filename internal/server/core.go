@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/noranite/Noranite-l3/internal/dataplane"
@@ -48,6 +49,10 @@ type sessionBinding struct {
 type Core struct {
 	routeKey           [32]byte
 	maxInnerPacketSize int
+	lifecycle          LifecycleConfig
+	// peerSnapshots is copy-on-write: packet TX lookups never contend with admin writes.
+	peerSnapshots atomic.Pointer[map[netip.Addr]*Peer]
+	peerEditMu    sync.Mutex
 	// sessionsMu protects the mutable global RX index only. It is intentionally
 	// NOT held during AEAD, replay commit or DATA encryption.
 	//
@@ -69,8 +74,8 @@ type Core struct {
 	//	-> exact O(1) tunnel IPv4 lookup
 	//	-> Peer current Session
 	//
-	// This map is immutable after New returns, so concurrent readers need no
-	// global lock. Peer owns synchronization for its mutable lifecycle state.
+	// Initial peers only; dynamic lookups use peerSnapshots.
+	// Kept for existing startup engine construction and compatibility tests.
 	peersByTunnelIPv4 map[netip.Addr]*Peer
 
 	// now exists only to make lifecycle boundary tests deterministic without
@@ -91,28 +96,19 @@ func New(config Config) (*Core, error) {
 	if err := config.Lifecycle.validate(); err != nil {
 		return nil, err
 	}
-	if len(config.Peers) == 0 {
-		return nil, fmt.Errorf(
-			"server must configure at least one peer: %w",
-			dataplane.ErrInvalidConfig,
-		)
-	}
-
 	core := &Core{
 		routeKey:           config.RouteKey,
 		maxInnerPacketSize: config.MaxInnerPacketSize,
+		lifecycle:          config.Lifecycle,
 		sessionsByID:       make(map[uint64]sessionBinding, len(config.Peers)),
 		peersByTunnelIPv4:  make(map[netip.Addr]*Peer, len(config.Peers)),
 		now:                time.Now,
 	}
 
 	for i, peerConfig := range config.Peers {
-		if !peerConfig.TunnelIPv4.IsValid() || !peerConfig.TunnelIPv4.Is4() {
-			return nil, fmt.Errorf(
-				"peer %d tunnel address must be IPv4: %w",
-				i,
-				dataplane.ErrInvalidConfig,
-			)
+		peerConfig.TunnelIPv4 = peerConfig.TunnelIPv4.Unmap()
+		if err := ValidateTunnelIPv4(peerConfig.TunnelIPv4); err != nil {
+			return nil, fmt.Errorf("peer %d: %w", i, err)
 		}
 		if _, exists := core.peersByTunnelIPv4[peerConfig.TunnelIPv4]; exists {
 			return nil, fmt.Errorf(
@@ -153,6 +149,11 @@ func New(config Config) (*Core, error) {
 		}
 	}
 
+	initial := make(map[netip.Addr]*Peer, len(core.peersByTunnelIPv4))
+	for ip, peer := range core.peersByTunnelIPv4 {
+		initial[ip] = peer
+	}
+	core.peerSnapshots.Store(&initial)
 	return core, nil
 }
 
@@ -282,11 +283,9 @@ func (c *Core) CurrentSession(tunnelIPv4 netip.Addr) *dataplane.Session {
 	return peer.CurrentSession()
 }
 
-// HasPeer reports whether tunnelIPv4 names one statically configured Peer.
-//
-// The peer map is immutable after Core construction, so this is a cheap
-// lock-free configuration validation hook for establishment providers. It does
-// not expose lifecycle state and does not make Core aware of handshake
+// HasPeer reports whether tunnelIPv4 is registered in the live peer snapshot.
+// This is a cheap lock-free validation hook for establishment providers.
+// It does not expose lifecycle state and does not make Core aware of handshake
 // credentials.
 func (c *Core) HasPeer(tunnelIPv4 netip.Addr) bool {
 	return c.lookupPeer(tunnelIPv4) != nil
@@ -316,45 +315,11 @@ func (c *Core) InstallPendingSession(
 		)
 	}
 
-	// peersByTunnelIPv4 is immutable after Core construction, so this lookup
-	// does not contend with packet RX/TX on a global lock.
-	peer := c.peersByTunnelIPv4[tunnelIPv4]
+	peer := c.lookupPeer(tunnelIPv4)
 	if peer == nil {
 		return fmt.Errorf("peer %s: %w", tunnelIPv4, ErrUnknownPeer)
 	}
-
-	// sessionsMu serializes global collision checks with insertion/removal.
-	// It may nest into Peer.mu here. No receive/TX path holds Peer.mu while
-	// acquiring sessionsMu, so this lock order has no reverse edge.
-	c.sessionsMu.Lock()
-	defer c.sessionsMu.Unlock()
-
-	id := session.ID()
-	now := c.now()
-	if !c.sessionIDAvailableLocked(id) {
-		return ErrSessionIDCollision
-	}
-
-	transition, err := peer.installPending(
-		session,
-		now,
-	)
-	if err != nil {
-		return err
-	}
-
-	// installPending can drop an expired previous and always supersedes an older
-	// pending. Remove those exact bindings before publishing the new one.
-	c.removeSessionLocked(peer, transition.retiredPending)
-	c.removeSessionLocked(peer, transition.retiredPrevious)
-
-	c.sessionsByID[id] = sessionBinding{
-		peer:       peer,
-		tunnelIPv4: tunnelIPv4,
-		session:    transition.installed,
-	}
-
-	return nil
+	return c.InstallPendingSessionForPeer(tunnelIPv4, peer, session)
 }
 
 // NewDataScratch creates worker-local DATA scratch keyed with the server's
@@ -364,8 +329,11 @@ func (c *Core) NewDataScratch() (*dataplane.DataScratch, error) {
 }
 
 func (c *Core) lookupPeer(tunnelIPv4 netip.Addr) *Peer {
-	// peersByTunnelIPv4 is immutable after New returns. Concurrent map reads are
-	// safe as long as no goroutine mutates the map, which Core never does.
+	tunnelIPv4 = tunnelIPv4.Unmap()
+	index := c.peerSnapshots.Load()
+	if index != nil {
+		return (*index)[tunnelIPv4]
+	}
 	return c.peersByTunnelIPv4[tunnelIPv4]
 }
 

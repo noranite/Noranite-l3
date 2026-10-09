@@ -236,12 +236,12 @@ start_opaque_server() {
 	if [[ -n "${OPAQUE_GODEBUG}" ]]; then
 		env_prefix="env GODEBUG=$(printf '%q' "${OPAQUE_GODEBUG}") "
 	fi
-	REMOTE_SERVER_PID="$(remote_shell "cd '${REMOTE_DIR}'; nohup ${env_prefix}./opaque-server -tun ol3s0 -mtu '${MTU}' -bind '${SERVER_BIND}:${SERVER_PORT}' -route-key-file route.key -private-key-file server.private -peers-file server.peers >opaque-server.log 2>&1 < /dev/null & echo \$!")"
-	if ! wait_remote_link ol3s0; then
+	REMOTE_SERVER_PID="$(remote_shell "cd '${REMOTE_DIR}'; nohup ${env_prefix}./opaque-server -tun nrnt0 -mtu '${MTU}' -bind '${SERVER_BIND}:${SERVER_PORT}' -route-key-file route.key -private-key-file server.private -peers-file server.peers -control-socket '${REMOTE_DIR}/control.sock' >opaque-server.log 2>&1 < /dev/null & echo \$!")"
+	if ! wait_remote_link nrnt0; then
 		remote_shell "cat '${REMOTE_DIR}/opaque-server.log' >&2 || true"
 		return 1
 	fi
-	remote_shell "ip addr add '${SERVER_TUNNEL}/24' dev ol3s0; ip link set dev ol3s0 mtu '${MTU}' up"
+	remote_shell "ip addr add '${SERVER_TUNNEL}/24' dev nrnt0; ip link set dev nrnt0 mtu '${MTU}' up"
 }
 
 start_opaque_clients() {
@@ -261,7 +261,7 @@ start_opaque_clients() {
 		ip netns exec "${namespace}" \
 			"${process_env[@]}" \
 			"${CLIENT_BIN}" \
-			-tun ol3c0 \
+			-tun nrnt0 \
 			-mtu "${MTU}" \
 			-tunnel-ip "$(client_tunnel_ip "${index}")" \
 			-bind "$(client_outer_ip "${index}"):0" \
@@ -272,13 +272,13 @@ start_opaque_clients() {
 			>"${STATE_DIR}/opaque-client-${index}.log" 2>&1 &
 		pid=$!
 		CLIENT_PIDS+=("${pid}")
-		if ! wait_local_link "${namespace}" ol3c0 "${pid}"; then
+		if ! wait_local_link "${namespace}" nrnt0 "${pid}"; then
 			cat "${STATE_DIR}/opaque-client-${index}.log" >&2 || true
 			return 1
 		fi
-		ip -n "${namespace}" addr add "$(client_tunnel_ip "${index}")/32" dev ol3c0
-		ip -n "${namespace}" link set dev ol3c0 mtu "${MTU}" up
-		ip -n "${namespace}" route add "${SERVER_TUNNEL}/32" dev ol3c0
+		ip -n "${namespace}" addr add "$(client_tunnel_ip "${index}")/32" dev nrnt0
+		ip -n "${namespace}" link set dev nrnt0 mtu "${MTU}" up
+		ip -n "${namespace}" route add "${SERVER_TUNNEL}/32" dev nrnt0
 	done
 }
 
@@ -308,7 +308,7 @@ stop_opaque() {
 		PROXY_PID=""
 	fi
 	if [[ -n "${REMOTE_SERVER_PID}" ]]; then
-		remote_shell "kill '${REMOTE_SERVER_PID}' >/dev/null 2>&1 || true; sleep 0.1; ip link del ol3s0 >/dev/null 2>&1 || true"
+		remote_shell "kill '${REMOTE_SERVER_PID}' >/dev/null 2>&1 || true; sleep 0.1; ip link del nrnt0 >/dev/null 2>&1 || true"
 		REMOTE_SERVER_PID=""
 	fi
 }

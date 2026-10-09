@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/netip"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/noranite/Noranite-l3/internal/dataplane"
@@ -15,13 +19,14 @@ import (
 	"github.com/noranite/Noranite-l3/internal/outerudp"
 	"github.com/noranite/Noranite-l3/internal/prototype"
 	"github.com/noranite/Noranite-l3/internal/server"
+	"github.com/noranite/Noranite-l3/internal/servercontrol"
 	"github.com/noranite/Noranite-l3/internal/tun"
 )
 
 func main() {
 	tunName := flag.String(
 		"tun",
-		"ol3s0",
+		"nrnt0",
 		"TUN interface name",
 	)
 
@@ -52,9 +57,14 @@ func main() {
 	peersFile := flag.String(
 		"peers-file",
 		"",
-		"peer configuration file: one '<tunnel-ipv4> <client-public-key>' per line",
+		"optional bootstrap peer configuration: '<tunnel-ipv4> <client-public-key> [name]' per line",
 	)
 
+	controlSocket := flag.String(
+		"control-socket",
+		servercontrol.DefaultSocketPath,
+		"local Unix control socket",
+	)
 	flag.Parse()
 
 	bind := mustAddrPort(*bindText)
@@ -68,28 +78,15 @@ func main() {
 		log.Fatalf("load peers: %v", err)
 	}
 
-	corePeers := make([]server.PeerConfig, 0, len(peerSpecs))
-	authorizedPeers := make([]noisehandshake.AuthorizedPeer, 0, len(peerSpecs))
-	for _, peer := range peerSpecs {
-		corePeers = append(corePeers, server.PeerConfig{
-			TunnelIPv4:     peer.tunnelIPv4,
-			InitialSession: nil,
-		})
-		authorizedPeers = append(authorizedPeers, noisehandshake.AuthorizedPeer{
-			TunnelIPv4: peer.tunnelIPv4,
-			PublicKey:  peer.publicKey,
-		})
-	}
-
+	// Runtime peers are always installed through servercontrol.Controller. This
+	// keeps startup and live administration on the same mutation path.
 	core, err := server.New(server.Config{
 		RouteKey:           routeKey,
 		MaxInnerPacketSize: *mtu,
 		Lifecycle: server.LifecycleConfig{
-			// Lifetime and grace values are operational policy, not wire constants.
 			GenerationLifetime: 24 * time.Hour,
 			ReceiveGrace:       5 * time.Second,
 		},
-		Peers: corePeers,
 	})
 	if err != nil {
 		log.Fatalf("create server core: %v", err)
@@ -102,7 +99,6 @@ func main() {
 	establishmentIngress, err := noisehandshake.NewServer(noisehandshake.ServerConfig{
 		Core:             core,
 		StaticPrivateKey: noisehandshake.PrivateKey(privateRaw),
-		Peers:            authorizedPeers,
 	})
 	if err != nil {
 		log.Fatalf("create Noise establishment provider: %v", err)
@@ -119,24 +115,70 @@ func main() {
 		log.Fatalf("listen UDP: %v", err)
 	}
 
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	runtimeDone := make(chan struct{})
+	go func() {
+		select {
+		case <-signalCtx.Done():
+			_ = dev.Close()
+			_ = conn.Close()
+		case <-runtimeDone:
+		}
+	}()
+
 	actualName, _ := dev.Name()
-	log.Printf(
-		"server started: tun=%s udp=%s peers=%d establishment=noise-ik session=none",
-		actualName,
-		conn.LocalAddr(),
-		len(peerSpecs),
+	var controller *servercontrol.Controller
+	var controlServer *servercontrol.UnixServer
+	shutdownControl := func() {
+		if controlServer != nil {
+			controlServer.Close()
+		}
+		if controller != nil {
+			controller.Close()
+		}
+	}
+
+	err = prototype.RunServerTunnelWithHook(
+		dev, conn, core, establishmentIngress, *mtu,
+		func(rx *server.RXEngine, tx *server.TXEngine) error {
+			var controllerErr error
+			controller, controllerErr = servercontrol.NewController(core, establishmentIngress, rx, tx)
+			if controllerErr != nil {
+				return controllerErr
+			}
+			for i, spec := range peerSpecs {
+				if err := controller.SetPeer(servercontrol.Peer{
+					TunnelIPv4: spec.TunnelIPv4,
+					PublicKey:  spec.PublicKey,
+				}); err != nil {
+					return fmt.Errorf("install bootstrap peer %d: %w", i, err)
+				}
+			}
+			var controlErr error
+			controlServer, controlErr = servercontrol.ListenUnix(*controlSocket, controller)
+			if controlErr != nil {
+				return controlErr
+			}
+			log.Printf(
+				"server started: tun=%s udp=%s peers=%d control=%s establishment=noise-ik session=none",
+				actualName,
+				conn.LocalAddr(),
+				len(peerSpecs),
+				*controlSocket,
+			)
+			return nil
+		},
+		shutdownControl,
 	)
 
-	err = prototype.RunServerTunnel(
-		dev,
-		conn,
-		core,
-		establishmentIngress,
-		*mtu,
-	)
-
-	if errors.Is(err, os.ErrClosed) ||
-		errors.Is(err, net.ErrClosed) {
+	close(runtimeDone)
+	interrupted := signalCtx.Err() != nil
+	stopSignals()
+	shutdownControl()
+	if interrupted {
+		return
+	}
+	if errors.Is(err, os.ErrClosed) || errors.Is(err, net.ErrClosed) {
 		return
 	}
 

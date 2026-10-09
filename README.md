@@ -56,6 +56,102 @@ Noranite не делает блокировку невозможной. Он д�
 Наиболее известный исследованный механизм GFW для блокировки fully-encrypted traffic работал с TCP; случайный UDP этим механизмом не блокировался, что подтверждается исследованиями USENIX 2023, 2025.  Более новые работы показывают, что GFW умеет stateful-анализ UDP и QUIC, но об использовании произвольного анализа opaque-UDP в настоящее время не известно.
 Для selective blocking цензору приходится опираться на метаданные потока, репутацию IP, статистическую классификацию или более грубую политику фильтрации.
 
+## Установка и управление
+
+Серверный установщик рассчитан на Linux с systemd и `iptables`. Он устанавливает уже собранные бинарники из `./bin`, создаёт ключи и конфигурацию в `/etc/noranite`, настраивает `nrnt0`, forwarding/NAT и запускает сервис.
+
+Для Debian/Ubuntu сервер можно установить одной командой:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/noranite/Noranite-l3/main/install/server/bootstrap.sh | sudo bash
+```
+
+Bootstrap скачивает исходники с GitHub во временный каталог, при необходимости использует временный Go toolchain нужной версии, собирает серверные бинарники и запускает штатный installer. При первой установке он попросит выбрать Internet-facing interface, tunnel address, UDP port, MTU (рекомендуется не более 1380) и режим доступа к локальной сети. При повторном запуске существующие `/etc/noranite/server.env`, ключи и peers сохраняются.
+
+Ручной вариант начинается со сборки необходимых бинарников из корня репозитория:
+
+```bash
+mkdir -p bin
+go build -o bin/opaque-server ./cmd/opaque-server
+go build -o bin/noranitectl ./cmd/noranitectl
+go build -o bin/noranite-peer ./cmd/noranite-peer
+go build -o bin/opaque-keygen ./cmd/opaque-keygen
+```
+
+Базовая установка:
+
+```bash
+sudo ./install/server/install.sh
+```
+
+По умолчанию используется tunnel `10.66.0.1/16`, UDP `0.0.0.0:51820`, MTU `1380`, а Internet-facing interface определяется по default route. При первой установке основные параметры можно задать явно:
+
+```bash
+sudo ./install/server/install.sh \
+  --egress-interface eth0 \
+  --tunnel-address 10.66.0.1/16 \
+  --bind 0.0.0.0:51820 \
+  --mtu 1380 \
+  --local-access deny
+```
+
+`--local-access deny` используется по умолчанию: VPN peers получают Internet egress, но не доступ к самому VPN-серверу и локальным сетям. `--local-access allow` снимает эту дополнительную изоляцию; дальнейший доступ определяется routing/firewall самого хоста.
+
+После установки основные файлы находятся в `/etc/noranite`:
+
+```text
+server.env       network/runtime parameters
+route.key        shared K_route
+server.private   server X25519 private key
+server.public    server X25519 public key
+server.peers     persistent bootstrap peers
+```
+
+Состояние сервиса:
+
+```bash
+sudo systemctl status noranite-server
+sudo systemctl restart noranite-server
+sudo journalctl -u noranite-server -f
+```
+
+### Пиры
+
+`/etc/noranite/server.peers` загружается при каждом старте процесса. Формат строки:
+
+```text
+<tunnel-ipv4> <client-public-key> [name]
+```
+
+Например:
+
+```text
+10.66.0.2 BASE64_KEY alice
+```
+
+Пиры из файла при старте проходят через тот же runtime Controller, что и динамические операции. Если файл некорректен или содержит конфликтующие IP/ключи, сервер не стартует.
+
+Для управления уже запущенным сервером используется локальный Unix socket `/run/noranite/control.sock` с mode `0600`. Удалённого management API нет; для удалённого администрирования достаточно SSH и `sudo noranitectl`:
+
+```bash
+sudo noranitectl peer list
+sudo noranitectl peer set --ip 10.66.0.2 --public-key BASE64_KEY
+sudo noranitectl peer remove --public-key BASE64_KEY
+```
+
+`peer set` идемпотентен. Повтор той же пары ничего не меняет; тот же public key с другим IP заменяет runtime peer и сбрасывает его активные sessions. IP, уже занятый другим public key, использовать нельзя.
+
+Для обычного добавления нового клиента есть provisioning tool: он генерирует client X25519 keypair, выбирает первый свободный адрес в настроенном `/16` и добавляет peer в runtime:
+
+```bash
+sudo noranite-peer add \
+  --tunnel-address 10.66.0.1/16 \
+  --private-key-out ./alice.key \
+  --public-key-out ./alice.pub
+```
+
+Runtime-команды не изменяют `server.peers`. Поэтому после рестарта сервер снова поднимет набор peers из этого файла; persistence/autosync, если он нужен, остаётся отдельным уровнем над runtime control plane.
+
 ## Криптография
 
 Сессия устанавливается через:

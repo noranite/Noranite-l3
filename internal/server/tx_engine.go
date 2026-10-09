@@ -121,10 +121,11 @@ type TXEngine struct {
 	send   TXSendFunc
 	report EngineErrorFunc
 
-	batchSize int
+	batchSize     int
+	peerQueueSize int
 
 	encryptQueue chan *txContainer
-	peerQueues   map[*Peer]chan *txContainer
+	peerQueues   map[*Peer]chan *txContainer // present+nil means registered but not activated
 
 	elementPool   sync.Pool
 	containerPool sync.Pool
@@ -195,6 +196,7 @@ func newTXEngine(
 		send:             send,
 		report:           report,
 		batchSize:        config.BatchSize,
+		peerQueueSize:    config.PeerQueueSize,
 		encryptQueue:     make(chan *txContainer, config.EncryptQueueSize),
 		peerQueues:       make(map[*Peer]chan *txContainer, len(core.peersByTunnelIPv4)),
 		submitSeen:       make(map[*OutboundOperation]struct{}),
@@ -206,7 +208,9 @@ func newTXEngine(
 		if _, exists := engine.peerQueues[peer]; exists {
 			continue
 		}
-		engine.peerQueues[peer] = make(chan *txContainer, config.PeerQueueSize)
+		// A nil queue means the Peer is registered with this engine but has not
+		// carried traffic yet. The ordered lane is allocated on first submission.
+		engine.peerQueues[peer] = nil
 	}
 	engine.submitContainerOrder = make([]*txContainer, 0, min(config.BatchSize, len(engine.peerQueues)))
 	engine.elementPool.New = func() any {
@@ -216,10 +220,6 @@ func newTXEngine(
 		return new(txContainer)
 	}
 
-	for peer, queue := range engine.peerQueues {
-		engine.workers.Add(1)
-		go engine.routineSequentialSender(peer, queue)
-	}
 	for i, scratch := range scratches {
 		engine.workers.Add(1)
 		go engine.routineEncryption(i, scratch)
@@ -280,6 +280,7 @@ func (e *TXEngine) EnqueueBatch(submissions []TXSubmission) ([]<-chan TXResult, 
 	results := make([]<-chan TXResult, len(submissions))
 	for i, submission := range submissions {
 		op := submission.Operation
+		e.ensurePeerQueueLocked(op.peer)
 		container := e.submitContainers[op.peer]
 		if container == nil {
 			container = e.getContainer(op.peer, false)
@@ -339,7 +340,7 @@ func (e *TXEngine) EnqueueOwnedBatch(
 		if op.peer == nil || op.session == nil {
 			return fmt.Errorf("invalid owned outbound operation %d: %w", i, dataplane.ErrInvalidConfig)
 		}
-		if _, exists := e.peerQueues[op.peer]; !exists {
+		if _, exists := e.peerQueues[op.peer]; !exists && !op.peer.IsRevoked() {
 			return fmt.Errorf("owned outbound operation %d belongs to unknown engine peer: %w", i, dataplane.ErrInvalidConfig)
 		}
 		if cap(submission.Buffer) < op.MaxWireSize() {
@@ -356,6 +357,11 @@ func (e *TXEngine) EnqueueOwnedBatch(
 	for i := range submissions {
 		submission := &submissions[i]
 		op := &submission.Operation
+		if _, registered := e.peerQueues[op.peer]; !registered {
+			releaser.Put(submission.Buffer)
+			continue
+		}
+		e.ensurePeerQueueLocked(op.peer)
 		container := e.submitContainers[op.peer]
 		if container == nil {
 			container = e.getContainer(op.peer, true)
@@ -379,6 +385,58 @@ func (e *TXEngine) EnqueueOwned(submission TXOwnedSubmission, releaser PacketBuf
 	var batch [1]TXOwnedSubmission
 	batch[0] = submission
 	return e.EnqueueOwnedBatch(batch[:], releaser)
+}
+
+// AddPeer registers a Peer before it becomes visible in Core. Its ordered
+// queue and worker are created lazily on the first accepted submission.
+func (e *TXEngine) AddPeer(peer *Peer) error {
+	if peer == nil {
+		return dataplane.ErrInvalidConfig
+	}
+	e.submitMu.Lock()
+	defer e.submitMu.Unlock()
+	if e.closed {
+		return ErrTXEngineClosed
+	}
+	if _, exists := e.peerQueues[peer]; exists {
+		return dataplane.ErrInvalidConfig
+	}
+	e.peerQueues[peer] = nil
+	return nil
+}
+
+// ensurePeerQueueLocked activates the per-Peer ordered lane. submitMu must be
+// held by the caller, which serializes activation with RetirePeer and Close.
+func (e *TXEngine) ensurePeerQueueLocked(peer *Peer) chan *txContainer {
+	queue, registered := e.peerQueues[peer]
+	if !registered {
+		return nil
+	}
+	if queue != nil {
+		return queue
+	}
+	queue = make(chan *txContainer, e.peerQueueSize)
+	e.peerQueues[peer] = queue
+	e.workers.Add(1)
+	go e.routineSequentialSender(peer, queue)
+	return queue
+}
+
+// RetirePeer prevents new submissions and drains previously accepted work.
+func (e *TXEngine) RetirePeer(peer *Peer) {
+	e.submitMu.Lock()
+	defer e.submitMu.Unlock()
+	// Close may already have closed every queue without removing the entries.
+	// Never close a channel a second time during daemon shutdown.
+	if e.closed {
+		return
+	}
+	if queue, exists := e.peerQueues[peer]; exists {
+		delete(e.peerQueues, peer)
+		if queue != nil {
+			close(queue)
+		}
+	}
 }
 
 func (e *TXEngine) publishSubmittedContainers() {
@@ -409,8 +467,11 @@ func (e *TXEngine) Close() {
 	e.closed = true
 	close(e.encryptQueue)
 	for _, queue := range e.peerQueues {
-		close(queue)
+		if queue != nil {
+			close(queue)
+		}
 	}
+	clear(e.peerQueues)
 	e.submitMu.Unlock()
 
 	e.workers.Wait()

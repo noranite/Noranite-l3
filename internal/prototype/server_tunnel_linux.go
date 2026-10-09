@@ -51,6 +51,17 @@ func RunServerTunnel(
 	establishmentIngress ServerEstablishmentIngress,
 	mtu int,
 ) error {
+	return RunServerTunnelWithHook(dev, conn, core, establishmentIngress, mtu, nil, nil)
+}
+
+// RunServerTunnelWithHook exposes the already-created engines to the local control API.
+// The callback runs before packet ingress begins.
+func RunServerTunnelWithHook(
+	dev tun.Device, conn *net.UDPConn, core *server.Core,
+	establishmentIngress ServerEstablishmentIngress, mtu int,
+	onReady func(*server.RXEngine, *server.TXEngine) error,
+	onShutdown func(),
+) error {
 	if dev == nil || conn == nil || core == nil {
 		return fmt.Errorf("server tunnel input is nil")
 	}
@@ -144,6 +155,20 @@ func RunServerTunnel(
 		}
 	}
 
+	if onReady != nil {
+		if err := onReady(rxEngine, txEngine); err != nil {
+			if onShutdown != nil {
+				onShutdown()
+			}
+			if establishmentExecutor != nil {
+				establishmentExecutor.CloseAndWait()
+			}
+			rxEngine.Close()
+			txEngine.Close()
+			return fmt.Errorf("server runtime ready hook: %w", err)
+		}
+	}
+
 	go drainTunEvents(dev)
 
 	var ingressWG sync.WaitGroup
@@ -181,6 +206,11 @@ func RunServerTunnel(
 	firstErr := <-errC
 	_ = dev.Close()
 	_ = conn.Close()
+	// Stop new admin mutations and wait for any in-flight Add/Remove while
+	// both engines are still open. No handler may outlive their Close calls.
+	if onShutdown != nil {
+		onShutdown()
+	}
 
 	// No new packet operations can be admitted after both readers exit.
 	ingressWG.Wait()

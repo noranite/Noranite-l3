@@ -11,8 +11,8 @@ NS_CLIENT="ol3c-${LIVE_ID}"
 NS_SERVER="ol3s-${LIVE_ID}"
 VETH_CLIENT="oc${LIVE_ID}"
 VETH_SERVER="os${LIVE_ID}"
-CLIENT_TUN="ol3c0"
-SERVER_TUN="ol3s0"
+CLIENT_TUN="nrnt0"
+SERVER_TUN="nrnt0"
 
 CLIENT_OUTER="192.0.2.2"
 SERVER_OUTER="192.0.2.1"
@@ -160,6 +160,7 @@ start_live_server() {
 		-route-key-file "${ROUTE_KEY_FILE}" \
 		-private-key-file "${SERVER_PRIVATE_KEY_FILE}" \
 		-peers-file "${SERVER_PEERS_FILE}" \
+		-control-socket "${LOG_DIR}/control.sock" \
 		>"${LOG_DIR}/server.log" 2>&1 &
 	SERVER_PID=$!
 

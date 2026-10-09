@@ -14,7 +14,7 @@ import (
 func main() {
 	name := flag.String(
 		"name",
-		"ol3test0",
+		"nrnt-test0",
 		"TUN interface name",
 	)
 	mtu := flag.Int(
