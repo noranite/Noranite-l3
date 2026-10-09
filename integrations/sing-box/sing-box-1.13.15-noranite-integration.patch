@@ -1,0 +1,644 @@
+diff --git a/constant/proxy.go b/constant/proxy.go
+index 278a46c..e228b66 100644
+--- a/constant/proxy.go
++++ b/constant/proxy.go
+@@ -15,6 +15,7 @@ const (
+ 	TypeTrojan       = "trojan"
+ 	TypeNaive        = "naive"
+ 	TypeWireGuard    = "wireguard"
++	TypeNoranite     = "noranite"
+ 	TypeHysteria     = "hysteria"
+ 	TypeTor          = "tor"
+ 	TypeSSH          = "ssh"
+@@ -68,6 +69,8 @@ func ProxyDisplayName(proxyType string) string {
+ 		return "Naive"
+ 	case TypeWireGuard:
+ 		return "WireGuard"
++	case TypeNoranite:
++		return "Noranite"
+ 	case TypeHysteria:
+ 		return "Hysteria"
+ 	case TypeTor:
+diff --git a/include/noranite.go b/include/noranite.go
+new file mode 100644
+index 0000000..aca7b32
+--- /dev/null
++++ b/include/noranite.go
+@@ -0,0 +1,12 @@
++//go:build with_noranite
++
++package include
++
++import (
++	"github.com/sagernet/sing-box/adapter/endpoint"
++	"github.com/sagernet/sing-box/protocol/noranite"
++)
++
++func registerNoraniteEndpoint(registry *endpoint.Registry) {
++	noranite.RegisterEndpoint(registry)
++}
+diff --git a/include/noranite_stub.go b/include/noranite_stub.go
+new file mode 100644
+index 0000000..6aa2c7e
+--- /dev/null
++++ b/include/noranite_stub.go
+@@ -0,0 +1,20 @@
++//go:build !with_noranite
++
++package include
++
++import (
++	"context"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/endpoint"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++func registerNoraniteEndpoint(registry *endpoint.Registry) {
++	endpoint.Register[option.NoraniteEndpointOptions](registry, C.TypeNoranite, func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NoraniteEndpointOptions) (adapter.Endpoint, error) {
++		return nil, E.New(`Noranite is not included in this build, rebuild with -tags with_noranite`)
++	})
++}
+diff --git a/include/registry.go b/include/registry.go
+index f090845..d37bb35 100644
+--- a/include/registry.go
++++ b/include/registry.go
+@@ -101,6 +101,7 @@ func EndpointRegistry() *endpoint.Registry {
+ 	registry := endpoint.NewRegistry()
+ 
+ 	registerWireGuardEndpoint(registry)
++	registerNoraniteEndpoint(registry)
+ 	registerTailscaleEndpoint(registry)
+ 
+ 	return registry
+diff --git a/option/noranite.go b/option/noranite.go
+new file mode 100644
+index 0000000..0dffff2
+--- /dev/null
++++ b/option/noranite.go
+@@ -0,0 +1,14 @@
++package option
++
++import "net/netip"
++
++type NoraniteEndpointOptions struct {
++	Server          netip.Addr `json:"server"`
++	ServerPort      uint16     `json:"server_port"`
++	Address         netip.Addr `json:"address"`
++	MTU             uint32     `json:"mtu,omitempty"`
++	RouteKey        string     `json:"route_key"`
++	PrivateKey      string     `json:"private_key"`
++	ServerPublicKey string     `json:"server_public_key"`
++	DialerOptions
++}
+diff --git a/protocol/noranite/endpoint.go b/protocol/noranite/endpoint.go
+new file mode 100644
+index 0000000..ddf75b6
+--- /dev/null
++++ b/protocol/noranite/endpoint.go
+@@ -0,0 +1,541 @@
++//go:build with_noranite
++
++package noranite
++
++import (
++	"context"
++	"encoding/base64"
++	"errors"
++	"net"
++	"net/netip"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	noraniteCore "github.com/noranite/Noranite-l3"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/endpoint"
++	"github.com/sagernet/sing-box/common/dialer"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing-box/transport/wireguard"
++	"github.com/sagernet/sing-tun"
++	"github.com/sagernet/sing/common/bufio"
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/logger"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/common/x/list"
++	"github.com/sagernet/sing/service"
++	"github.com/sagernet/sing/service/pause"
++)
++
++const transportRedialDelay = time.Second
++
++var (
++	_ adapter.Endpoint                   = (*Endpoint)(nil)
++	_ dialer.PacketDialerWithDestination = (*Endpoint)(nil)
++)
++
++func RegisterEndpoint(registry *endpoint.Registry) {
++	endpoint.Register[option.NoraniteEndpointOptions](registry, C.TypeNoranite, NewEndpoint)
++}
++
++type Endpoint struct {
++	endpoint.Adapter
++	ctx            context.Context
++	dnsRouter      adapter.DNSRouter
++	logger         logger.ContextLogger
++	outboundDialer N.Dialer
++	pauseManager   pause.Manager
++
++	serverEndpoint  netip.AddrPort
++	tunnelIPv4      netip.Addr
++	mtu             int
++	routeKey        [32]byte
++	privateKey      [32]byte
++	serverPublicKey [32]byte
++
++	lifecycleMu sync.Mutex
++	device      wireguard.Device
++	client      *noraniteCore.Client
++	runCancel   context.CancelFunc
++	runDone     chan error
++
++	transportWake chan struct{}
++	transportDone chan struct{}
++	pauseCallback *list.Element[pause.Callback]
++
++	started atomic.Bool
++}
++
++func NewEndpoint(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options option.NoraniteEndpointOptions) (adapter.Endpoint, error) {
++	if !tun.WithGVisor {
++		return nil, E.New("Noranite requires gVisor support, rebuild with -tags with_gvisor")
++	}
++
++	server := options.Server.Unmap()
++	if !server.IsValid() || !server.Is4() {
++		return nil, E.New("Noranite server must be an IPv4 address")
++	}
++	if options.ServerPort == 0 {
++		return nil, E.New("Noranite server_port must be non-zero")
++	}
++
++	tunnelIPv4 := options.Address.Unmap()
++	if !tunnelIPv4.IsValid() || !tunnelIPv4.Is4() {
++		return nil, E.New("Noranite address must be an IPv4 address")
++	}
++
++	mtu := int(options.MTU)
++	if mtu == 0 {
++		mtu = noraniteCore.DefaultMTU
++	}
++	if mtu < noraniteCore.MinTunnelMTU || mtu > noraniteCore.MaxTunnelMTU {
++		return nil, E.New("invalid Noranite MTU: ", mtu, ", want [", noraniteCore.MinTunnelMTU, ", ", noraniteCore.MaxTunnelMTU, "]")
++	}
++
++	routeKey, err := decodeKey32("route_key", options.RouteKey)
++	if err != nil {
++		return nil, err
++	}
++	privateKey, err := decodeKey32("private_key", options.PrivateKey)
++	if err != nil {
++		return nil, err
++	}
++	serverPublicKey, err := decodeKey32("server_public_key", options.ServerPublicKey)
++	if err != nil {
++		return nil, err
++	}
++
++	outboundDialer, err := dialer.NewWithOptions(dialer.Options{
++		Context: ctx,
++		Options: options.DialerOptions,
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	return &Endpoint{
++		Adapter: endpoint.NewAdapterWithDialerOptions(
++			C.TypeNoranite,
++			tag,
++			[]string{N.NetworkTCP, N.NetworkUDP},
++			options.DialerOptions,
++		),
++		ctx:             ctx,
++		dnsRouter:       service.FromContext[adapter.DNSRouter](ctx),
++		logger:          logger,
++		outboundDialer:  outboundDialer,
++		pauseManager:    service.FromContext[pause.Manager](ctx),
++		serverEndpoint:  netip.AddrPortFrom(server, options.ServerPort),
++		transportWake:   make(chan struct{}, 1),
++		tunnelIPv4:      tunnelIPv4,
++		mtu:             mtu,
++		routeKey:        routeKey,
++		privateKey:      privateKey,
++		serverPublicKey: serverPublicKey,
++	}, nil
++}
++
++func (e *Endpoint) Start(stage adapter.StartStage) error {
++	if stage != adapter.StartStatePostStart {
++		return nil
++	}
++
++	e.lifecycleMu.Lock()
++	if e.client != nil {
++		e.lifecycleMu.Unlock()
++		return E.New("Noranite endpoint is already started")
++	}
++
++	runCtx, cancel := context.WithCancel(e.ctx)
++	device, err := wireguard.NewDevice(wireguard.DeviceOptions{
++		Context: runCtx,
++		Logger:  e.logger,
++		System:  false,
++		MTU:     uint32(e.mtu),
++		Address: []netip.Prefix{netip.PrefixFrom(e.tunnelIPv4, 32)},
++	})
++	if err != nil {
++		e.lifecycleMu.Unlock()
++		cancel()
++		return E.Cause(err, "create Noranite gVisor device")
++	}
++
++	// Outer UDP acquisition is intentionally lazy. Starting sing-box while the
++	// host is offline must not fail the endpoint; the transport manager publishes
++	// the first socket when network policy becomes usable.
++	client, err := noraniteCore.NewClient(noraniteCore.ClientConfig{
++		TunnelIPv4:       e.tunnelIPv4,
++		ServerEndpoint:   e.serverEndpoint,
++		MTU:              e.mtu,
++		RouteKey:         e.routeKey,
++		StaticPrivateKey: e.privateKey,
++		ServerPublicKey:  e.serverPublicKey,
++	}, device, nil)
++	if err != nil {
++		e.lifecycleMu.Unlock()
++		_ = device.Close()
++		cancel()
++		return E.Cause(err, "create Noranite client")
++	}
++
++	transportDone := make(chan struct{})
++	e.device = device
++	e.client = client
++	e.runCancel = cancel
++	e.runDone = make(chan error, 1)
++	e.transportDone = transportDone
++	e.started.Store(true)
++	runDone := e.runDone
++	if e.pauseManager != nil {
++		// Pinned pause.Manager registration only links the callback; our callback
++		// never takes lifecycleMu, so registering here avoids a startup lost-wake
++		// window without introducing a lock cycle.
++		e.pauseCallback = e.pauseManager.RegisterCallback(e.onPauseUpdated)
++	}
++	e.lifecycleMu.Unlock()
++
++	go e.runClient(runCtx, cancel, client, runDone)
++	go e.runTransportManager(runCtx, client, e.transportWake, transportDone)
++	return nil
++}
++
++func (e *Endpoint) runClient(ctx context.Context, cancel context.CancelFunc, client *noraniteCore.Client, done chan<- error) {
++	err := client.Run(ctx)
++	cancel()
++	e.started.Store(false)
++	if err != nil &&
++		!errors.Is(err, context.Canceled) &&
++		!errors.Is(err, noraniteCore.ErrClientClosed) {
++		e.logger.Error("Noranite client stopped: ", err)
++	}
++	done <- err
++}
++
++func (e *Endpoint) runTransportManager(
++	ctx context.Context,
++	client *noraniteCore.Client,
++	wake <-chan struct{},
++	done chan<- struct{},
++) {
++	defer close(done)
++	failures := client.TransportFailures()
++
++	needDial := true
++	var currentGeneration uint64
++
++	for {
++		if !needDial {
++			select {
++			case <-ctx.Done():
++				return
++			case failure := <-failures:
++				if failure.Generation != currentGeneration {
++					continue
++				}
++				e.logger.Info("Noranite outer transport unavailable (generation ", failure.Generation, "): ", failure.Err)
++				needDial = true
++			case <-wake:
++				// pause/wake is analogous to WireGuard Down/Up. If the old tracked
++				// socket was already closed by ResetNetwork, TransportFailure reaches
++				// the same path; otherwise replace it after the host becomes active.
++				needDial = true
++			}
++			continue
++		}
++
++		if !e.waitTransportActive(ctx, wake) {
++			return
++		}
++		// A wake that released the pause wait is already accounted for. Drop the
++		// coalesced token before dialing so it cannot force an immediate duplicate
++		// replacement after success. A new pause is checked again below.
++		select {
++		case <-wake:
++		default:
++		}
++		if e.pauseManager != nil && e.pauseManager.IsPaused() {
++			continue
++		}
++
++		transport, err := e.dialTransport(ctx)
++		if err == nil {
++			if ctx.Err() != nil {
++				_ = transport.Close()
++				return
++			}
++			if e.pauseManager != nil && e.pauseManager.IsPaused() {
++				// Pause raced the dial. Do not publish a socket acquired while the
++				// host path is being suspended or has no default network.
++				_ = transport.Close()
++				continue
++			}
++
++			generation, replaceErr := client.ReplaceTransport(transport)
++			if replaceErr == nil {
++				currentGeneration = generation
++				needDial = false
++				continue
++			}
++			_ = transport.Close()
++			if errors.Is(replaceErr, noraniteCore.ErrClientClosed) || ctx.Err() != nil {
++				return
++			}
++			e.logger.Error("replace Noranite outer transport: ", replaceErr)
++			return
++		}
++		if ctx.Err() != nil {
++			return
++		}
++		e.logger.Warn("dial Noranite outer transport: ", err, "; retry in ", transportRedialDelay)
++
++		timer := time.NewTimer(transportRedialDelay)
++		select {
++		case <-ctx.Done():
++			stopTimer(timer)
++			return
++		case <-timer.C:
++		case failure := <-failures:
++			stopTimer(timer)
++			if failure.Generation == currentGeneration {
++				e.logger.Info("Noranite outer transport unavailable during recovery (generation ", failure.Generation, "): ", failure.Err)
++			}
++		case <-wake:
++			stopTimer(timer)
++		}
++	}
++}
++
++func (e *Endpoint) waitTransportActive(ctx context.Context, wake <-chan struct{}) bool {
++	// WireGuard ClientBind uses pause.Manager.WaitActive(). That method observes
++	// the manager/root context, while Endpoint.Close cancels this worker's runCtx
++	// and waits for it. Use the same pause state with callback wake so shutdown
++	// remains locally cancellable.
++	for e.pauseManager != nil && e.pauseManager.IsPaused() {
++		select {
++		case <-ctx.Done():
++			return false
++		case <-wake:
++		}
++	}
++	return ctx.Err() == nil
++}
++
++func stopTimer(timer *time.Timer) {
++	if timer == nil || timer.Stop() {
++		return
++	}
++	select {
++	case <-timer.C:
++	default:
++	}
++}
++
++func (e *Endpoint) dialTransport(ctx context.Context) (net.Conn, error) {
++	return e.outboundDialer.DialContext(
++		ctx,
++		N.NetworkUDP,
++		M.SocksaddrFrom(e.serverEndpoint.Addr(), e.serverEndpoint.Port()),
++	)
++}
++
++func (e *Endpoint) onPauseUpdated(event int) {
++	switch event {
++	case pause.EventDevicePaused, pause.EventNetworkPause, pause.EventDeviceWake, pause.EventNetworkWake:
++	default:
++		return
++	}
++
++	select {
++	case e.transportWake <- struct{}{}:
++	default:
++	}
++}
++
++func (e *Endpoint) Close() error {
++	e.started.Store(false)
++
++	e.lifecycleMu.Lock()
++	client := e.client
++	cancel := e.runCancel
++	done := e.runDone
++	transportDone := e.transportDone
++	pauseCallback := e.pauseCallback
++	e.client = nil
++	e.device = nil
++	e.runCancel = nil
++	e.runDone = nil
++	e.transportDone = nil
++	e.pauseCallback = nil
++	e.lifecycleMu.Unlock()
++
++	if pauseCallback != nil && e.pauseManager != nil {
++		e.pauseManager.UnregisterCallback(pauseCallback)
++	}
++	if cancel != nil {
++		cancel()
++	}
++	if transportDone != nil {
++		<-transportDone
++	}
++	if client == nil {
++		return nil
++	}
++
++	err := client.Close()
++	if done != nil {
++		<-done
++	}
++	return err
++}
++
++func (e *Endpoint) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	switch N.NetworkName(network) {
++	case N.NetworkTCP:
++		e.logger.InfoContext(ctx, "outbound connection to ", destination)
++	case N.NetworkUDP:
++		e.logger.InfoContext(ctx, "outbound packet connection to ", destination)
++	}
++
++	device, err := e.currentDevice(ctx)
++	if err != nil {
++		return nil, err
++	}
++	if destination.IsDomain() {
++		addresses, err := e.lookupIPv4(ctx, destination.Fqdn)
++		if err != nil {
++			return nil, err
++		}
++		return N.DialSerial(ctx, device, network, destination, addresses)
++	}
++
++	destination, err = normalizeIPv4Destination(destination)
++	if err != nil {
++		return nil, err
++	}
++	return device.DialContext(ctx, network, destination)
++}
++
++func (e *Endpoint) ListenPacketWithDestination(ctx context.Context, destination M.Socksaddr) (net.PacketConn, netip.Addr, error) {
++	e.logger.InfoContext(ctx, "outbound packet connection to ", destination)
++
++	device, err := e.currentDevice(ctx)
++	if err != nil {
++		return nil, netip.Addr{}, err
++	}
++	if destination.IsDomain() {
++		addresses, err := e.lookupIPv4(ctx, destination.Fqdn)
++		if err != nil {
++			return nil, netip.Addr{}, err
++		}
++		return N.ListenSerial(ctx, device, destination, addresses)
++	}
++
++	destination, err = normalizeIPv4Destination(destination)
++	if err != nil {
++		return nil, netip.Addr{}, err
++	}
++	packetConn, err := device.ListenPacket(ctx, destination)
++	if err != nil {
++		return nil, netip.Addr{}, err
++	}
++	return packetConn, destination.Addr, nil
++}
++
++func (e *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
++	packetConn, destinationAddress, err := e.ListenPacketWithDestination(ctx, destination)
++	if err != nil {
++		return nil, err
++	}
++	if destinationAddress.IsValid() && destination != M.SocksaddrFrom(destinationAddress, destination.Port) {
++		return bufio.NewNATPacketConn(
++			bufio.NewPacketConn(packetConn),
++			M.SocksaddrFrom(destinationAddress, destination.Port),
++			destination,
++		), nil
++	}
++	return packetConn, nil
++}
++
++func (e *Endpoint) currentDevice(ctx context.Context) (wireguard.Device, error) {
++	if !e.started.Load() {
++		return nil, E.New("Noranite is not ready yet")
++	}
++
++	e.lifecycleMu.Lock()
++	device := e.device
++	client := e.client
++	e.lifecycleMu.Unlock()
++	if device == nil || client == nil {
++		return nil, E.New("Noranite is not ready yet")
++	}
++	if err := client.WaitReady(ctx); err != nil {
++		return nil, E.Cause(err, "wait for Noranite session readiness")
++	}
++	return device, nil
++}
++
++func (e *Endpoint) lookupIPv4(ctx context.Context, domain string) ([]netip.Addr, error) {
++	if e.dnsRouter == nil {
++		return nil, E.New("missing DNS router for Noranite destination lookup")
++	}
++
++	addresses, err := e.dnsRouter.Lookup(ctx, domain, adapter.DNSQueryOptions{})
++	if err != nil {
++		return nil, err
++	}
++
++	ipv4 := make([]netip.Addr, 0, len(addresses))
++	for _, address := range addresses {
++		address = address.Unmap()
++		if address.Is4() {
++			ipv4 = append(ipv4, address)
++		}
++	}
++	if len(ipv4) == 0 {
++		return nil, E.New("Noranite destination has no IPv4 address: ", domain)
++	}
++	return ipv4, nil
++}
++
++func normalizeIPv4Destination(destination M.Socksaddr) (M.Socksaddr, error) {
++	if !destination.Addr.IsValid() {
++		return M.Socksaddr{}, E.New("invalid Noranite destination: ", destination)
++	}
++
++	address := destination.Addr.Unmap()
++	if !address.Is4() {
++		return M.Socksaddr{}, E.New("Noranite supports IPv4 destinations only: ", destination)
++	}
++	destination.Addr = address
++	return destination, nil
++}
++
++func decodeKey32(name string, encoded string) ([32]byte, error) {
++	if encoded == "" {
++		return [32]byte{}, E.New("missing Noranite ", name)
++	}
++
++	raw, err := base64.StdEncoding.DecodeString(encoded)
++	if err != nil {
++		return [32]byte{}, E.Cause(err, "decode Noranite ", name)
++	}
++	if len(raw) != 32 {
++		return [32]byte{}, E.New("invalid Noranite ", name, " length: ", len(raw), ", want 32")
++	}
++
++	var key [32]byte
++	copy(key[:], raw)
++	var nonZero byte
++	for _, value := range key {
++		nonZero |= value
++	}
++	if nonZero == 0 {
++		return [32]byte{}, E.New("Noranite ", name, " must not be all-zero")
++	}
++	return key, nil
++}
