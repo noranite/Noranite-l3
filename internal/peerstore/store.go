@@ -2,10 +2,12 @@ package peerstore
 
 import (
 	"bufio"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/noranite/Noranite-l3/internal/noisehandshake"
@@ -86,4 +88,79 @@ func Parse(reader io.Reader, source string) ([]Record, error) {
 		return nil, fmt.Errorf("read peers file %q: %w", source, err)
 	}
 	return records, nil
+}
+
+// WriteAtomic replaces path with a canonical snapshot of records. The file is
+// written in the same directory and renamed into place so readers never observe
+// a partially written peer set.
+func WriteAtomic(path string, records []Record) error {
+	if path == "" {
+		return fmt.Errorf("peers file path is empty")
+	}
+
+	seenIPs := make(map[netip.Addr]struct{}, len(records))
+	seenKeys := make(map[noisehandshake.PublicKey]struct{}, len(records))
+	for i := range records {
+		addr := records[i].TunnelIPv4.Unmap()
+		if err := server.ValidateTunnelIPv4(addr); err != nil {
+			return fmt.Errorf("peer %d: %w", i, err)
+		}
+		if _, exists := seenIPs[addr]; exists {
+			return fmt.Errorf("peer %d: duplicate tunnel IPv4 %s", i, addr)
+		}
+		if _, exists := seenKeys[records[i].PublicKey]; exists {
+			return fmt.Errorf("peer %d: duplicate client public key", i)
+		}
+		if records[i].Name != "" && (len(strings.Fields(records[i].Name)) != 1 || strings.Contains(records[i].Name, "#")) {
+			return fmt.Errorf("peer %d: name must not contain whitespace or #", i)
+		}
+		seenIPs[addr] = struct{}{}
+		seenKeys[records[i].PublicKey] = struct{}{}
+	}
+
+	directory := filepath.Dir(path)
+	file, err := os.CreateTemp(directory, "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return fmt.Errorf("create temporary peers file: %w", err)
+	}
+	temporaryPath := file.Name()
+	committed := false
+	defer func() {
+		_ = file.Close()
+		if !committed {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+
+	if err := file.Chmod(0o600); err != nil {
+		return fmt.Errorf("chmod temporary peers file: %w", err)
+	}
+	writer := bufio.NewWriter(file)
+	for _, record := range records {
+		publicKey := base64.StdEncoding.EncodeToString(record.PublicKey[:])
+		addr := record.TunnelIPv4.Unmap()
+		if record.Name == "" {
+			if _, err := fmt.Fprintf(writer, "%s %s\n", addr, publicKey); err != nil {
+				return fmt.Errorf("write temporary peers file: %w", err)
+			}
+			continue
+		}
+		if _, err := fmt.Fprintf(writer, "%s %s %s\n", addr, publicKey, record.Name); err != nil {
+			return fmt.Errorf("write temporary peers file: %w", err)
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("flush temporary peers file: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync temporary peers file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close temporary peers file: %w", err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("replace peers file: %w", err)
+	}
+	committed = true
+	return nil
 }

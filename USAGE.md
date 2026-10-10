@@ -84,17 +84,26 @@ For example:
 
 Peers loaded from the file go through the same runtime Controller used by dynamic operations. If the file is invalid or contains conflicting IPs or keys, the server refuses to start.
 
-A running server is managed through the local Unix socket `/run/noranite/control.sock`, created with mode `0600`. There is no remote management API; SSH plus `sudo noranitectl` is sufficient for remote administration:
+A running server is managed through the local Unix socket `/run/noranite/control.sock`, created with mode `0600`. There is no remote management API; SSH plus `sudo noranitectl` is sufficient for remote administration.
+
+`noranitectl` is the low-level runtime control interface:
 
 ```bash
 sudo noranitectl peer list
 sudo noranitectl peer set --ip 10.66.0.2 --public-key BASE64_KEY
 sudo noranitectl peer remove --public-key BASE64_KEY
+sudo noranitectl peer sync --file /etc/noranite/server.peers
 ```
 
-`peer set` is idempotent. Repeating the same pair changes nothing; setting the same public key with a different IP replaces the runtime peer and drops its active sessions. An IP already assigned to another public key cannot be reused.
+`peer list`, `peer set`, and `peer remove` operate on the running server only and do not modify `server.peers`. `peer set` is idempotent. Repeating the same pair changes nothing; setting the same public key with a different IP replaces the runtime peer and drops its active sessions. An IP already assigned to another public key cannot be reused.
 
-For normal client provisioning, `noranite-peer` generates a client X25519 keypair, selects the first free address in the configured `/16`, and adds the peer to the runtime:
+`peer sync --file FILE` loads the complete peer set from `FILE` and replaces the runtime peer configuration with that snapshot. It does not modify the file. This is the machine-oriented entry point for workflows that manage the peer file themselves. For example, after editing `/etc/noranite/server.peers` directly, apply the complete desired state without restarting the server:
+
+```bash
+sudo noranitectl peer sync --file /etc/noranite/server.peers
+```
+
+For normal client provisioning, use `noranite-peer`. It manages the persistent peer file and keeps the running server in sync with it. `add` generates a client X25519 keypair, selects the first free address in the configured `/16`, writes the peer to `server.peers`, and applies it to the running server:
 
 ```bash
 sudo noranite-peer add \
@@ -103,7 +112,15 @@ sudo noranite-peer add \
   --public-key-out ./alice.pub
 ```
 
-Runtime commands do not modify `server.peers`. After a restart, the server therefore restores the peer set from that file. Persistence or autosync, if required, remains a separate layer above the runtime control plane.
+To remove a provisioned peer from both the persistent configuration and the running server:
+
+```bash
+sudo noranite-peer remove --public-key BASE64_KEY
+```
+
+Both commands use `/etc/noranite/server.peers` by default; use `--peers-file PATH` to select another persistent peer file. The persistent file is updated before the runtime operation. If the point runtime update fails, `noranite-peer` attempts a full runtime reconciliation from the peer file.
+
+On process restart, the server loads `server.peers` again, so the persistent file remains the desired peer set across restarts.
 
 ## Client based on sing-box
 

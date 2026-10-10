@@ -14,9 +14,12 @@ import (
 	"strings"
 
 	"github.com/noranite/Noranite-l3/internal/noisehandshake"
+	"github.com/noranite/Noranite-l3/internal/peerstore"
 	"github.com/noranite/Noranite-l3/internal/provisioning"
 	"github.com/noranite/Noranite-l3/internal/servercontrol"
 )
+
+const defaultPeersFile = "/etc/noranite/server.peers"
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
@@ -26,22 +29,33 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) error {
-	if len(args) == 0 || args[0] != "add" {
-		return errors.New("usage: noranite-peer add --tunnel-address IP/16 --private-key-out PATH [options]")
+	if len(args) == 0 {
+		return errors.New("usage: noranite-peer {add|remove} [options]")
 	}
+	switch args[0] {
+	case "add":
+		return runAdd(args[1:], stdout, stderr)
+	case "remove":
+		return runRemove(args[1:], stdout, stderr)
+	default:
+		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
 
+func runAdd(args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("noranite-peer add", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	tunnelAddressText := flags.String("tunnel-address", "", "server tunnel address and /16 prefix, e.g. 10.66.0.1/16")
 	tunName := flags.String("tun", "nrnt0", "server TUN interface used to verify --tunnel-address")
 	privateKeyOut := flags.String("private-key-out", "", "new client private-key file (created mode 0600)")
 	publicKeyOut := flags.String("public-key-out", "", "optional new client public-key file")
+	peersFile := flags.String("peers-file", defaultPeersFile, "persistent server peer configuration file")
 	socket := flags.String("socket", servercontrol.DefaultSocketPath, "server Unix control socket")
-	if err := flags.Parse(args[1:]); err != nil {
+	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 || *tunnelAddressText == "" || *privateKeyOut == "" {
-		return errors.New("usage: noranite-peer add --tunnel-address IP/16 --private-key-out PATH [--public-key-out PATH] [-socket PATH]")
+		return errors.New("usage: noranite-peer add --tunnel-address IP/16 --private-key-out PATH [--public-key-out PATH] [--peers-file PATH] [--socket PATH]")
 	}
 
 	tunnelAddress, err := netip.ParsePrefix(*tunnelAddressText)
@@ -55,6 +69,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
+	persistentPeers, err := peerstore.Load(*peersFile)
+	if err != nil {
+		return fmt.Errorf("load persistent peers: %w", err)
+	}
 	response, err := servercontrol.Do(*socket, servercontrol.Request{Operation: servercontrol.OperationPeerList})
 	if err != nil {
 		return fmt.Errorf("list runtime peers: %w", err)
@@ -63,7 +81,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("list runtime peers: %s", response.Error)
 	}
 
-	used := make([]netip.Addr, 0, len(response.Peers))
+	used := make([]netip.Addr, 0, len(persistentPeers)+len(response.Peers))
+	for _, peer := range persistentPeers {
+		used = append(used, peer.TunnelIPv4)
+	}
 	for _, peer := range response.Peers {
 		ip, err := netip.ParseAddr(peer.IP)
 		if err != nil {
@@ -72,6 +93,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 		used = append(used, ip.Unmap())
 	}
 
+	assigned, err := provisioning.AllocateTunnelIPv4(tunnelAddress, used)
+	if err != nil {
+		return err
+	}
 	privateKey, publicKey, err := generateKeyPair()
 	if err != nil {
 		return err
@@ -99,40 +124,136 @@ func run(args []string, stdout, stderr io.Writer) error {
 		}()
 	}
 
-	var assigned netip.Addr
-	for {
-		assigned, err = provisioning.AllocateTunnelIPv4(tunnelAddress, used)
-		if err != nil {
-			return err
-		}
-		setResponse, err := servercontrol.Do(*socket, servercontrol.Request{
+	desired := append([]peerstore.Record(nil), persistentPeers...)
+	desired = append(desired, peerstore.Record{TunnelIPv4: assigned, PublicKey: publicKey})
+	if err := peerstore.WriteAtomic(*peersFile, desired); err != nil {
+		return fmt.Errorf("persist peer: %w", err)
+	}
+
+	// server.peers is authoritative after this point. Keep the generated client
+	// identity even if the point runtime update needs full reconciliation.
+	cleanupPrivate = false
+	cleanupPublic = false
+
+	if err := applyRuntimeWithResync(
+		*socket,
+		servercontrol.Request{
 			Operation: servercontrol.OperationPeerSet,
 			Peer: &servercontrol.WirePeer{
 				IP:        assigned.String(),
 				PublicKey: servercontrol.EncodePublicKey(publicKey),
 			},
-		})
-		if err != nil {
-			return fmt.Errorf("set runtime peer: %w", err)
-		}
-		if setResponse.OK {
-			break
-		}
-		if setResponse.ErrorCode != servercontrol.ErrorCodePeerConflict {
-			return fmt.Errorf("set runtime peer: %s", setResponse.Error)
-		}
-		// Another control client may have claimed the address after our list.
-		// Skip the collided address and retry with the same identity.
-		used = append(used, assigned)
+		},
+		*peersFile,
+		stderr,
+	); err != nil {
+		return err
 	}
 
-	cleanupPrivate = false
-	cleanupPublic = false
 	fmt.Fprintf(stdout, "tunnel_ip=%s\n", assigned)
 	fmt.Fprintf(stdout, "public_key=%s\n", servercontrol.EncodePublicKey(publicKey))
 	fmt.Fprintf(stdout, "private_key_file=%s\n", *privateKeyOut)
 	if *publicKeyOut != "" {
 		fmt.Fprintf(stdout, "public_key_file=%s\n", *publicKeyOut)
+	}
+	return nil
+}
+
+func runRemove(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("noranite-peer remove", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	publicKeyText := flags.String("public-key", "", "client X25519 public key (Base64)")
+	peersFile := flags.String("peers-file", defaultPeersFile, "persistent server peer configuration file")
+	socket := flags.String("socket", servercontrol.DefaultSocketPath, "server Unix control socket")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *publicKeyText == "" {
+		return errors.New("usage: noranite-peer remove --public-key KEY [--peers-file PATH] [--socket PATH]")
+	}
+
+	publicKey, err := noisehandshake.ParsePublicKey(*publicKeyText)
+	if err != nil {
+		return fmt.Errorf("parse public key: %w", err)
+	}
+	persistentPeers, err := peerstore.Load(*peersFile)
+	if err != nil {
+		return fmt.Errorf("load persistent peers: %w", err)
+	}
+
+	desired := make([]peerstore.Record, 0, len(persistentPeers))
+	removed := false
+	for _, peer := range persistentPeers {
+		if peer.PublicKey == publicKey {
+			removed = true
+			continue
+		}
+		desired = append(desired, peer)
+	}
+	if removed {
+		if err := peerstore.WriteAtomic(*peersFile, desired); err != nil {
+			return fmt.Errorf("persist peer removal: %w", err)
+		}
+	}
+
+	if err := applyRuntimeWithResync(
+		*socket,
+		servercontrol.Request{
+			Operation: servercontrol.OperationPeerRemove,
+			PublicKey: servercontrol.EncodePublicKey(publicKey),
+		},
+		*peersFile,
+		stderr,
+	); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(stdout, "public_key=%s\n", servercontrol.EncodePublicKey(publicKey))
+	fmt.Fprintf(stdout, "removed_from_config=%t\n", removed)
+	return nil
+}
+
+func applyRuntimeWithResync(
+	socket string,
+	request servercontrol.Request,
+	peersFile string,
+	stderr io.Writer,
+) error {
+	if err := doRuntimeRequest(socket, request); err != nil {
+		pointErr := err
+		if err := syncRuntimePeersFromFile(socket, peersFile); err != nil {
+			return fmt.Errorf("%s failed: %v; peer sync recovery failed: %w", request.Operation, pointErr, err)
+		}
+		fmt.Fprintf(stderr, "warning: %s failed: %v; recovered with peer sync\n", request.Operation, pointErr)
+	}
+	return nil
+}
+
+func syncRuntimePeersFromFile(socket, path string) error {
+	peers, err := peerstore.Load(path)
+	if err != nil {
+		return fmt.Errorf("load persistent peers: %w", err)
+	}
+	wirePeers := make([]servercontrol.WirePeer, 0, len(peers))
+	for _, peer := range peers {
+		wirePeers = append(wirePeers, servercontrol.WirePeer{
+			IP:        peer.TunnelIPv4.String(),
+			PublicKey: servercontrol.EncodePublicKey(peer.PublicKey),
+		})
+	}
+	return doRuntimeRequest(socket, servercontrol.Request{
+		Operation: servercontrol.OperationPeerSync,
+		Peers:     &wirePeers,
+	})
+}
+
+func doRuntimeRequest(socket string, request servercontrol.Request) error {
+	response, err := servercontrol.Do(socket, request)
+	if err != nil {
+		return err
+	}
+	if !response.OK {
+		return errors.New(response.Error)
 	}
 	return nil
 }
