@@ -7,15 +7,27 @@ import (
 	coreserver "github.com/noranite/Noranite-l3/internal/server"
 )
 
-// ValidateAuthorizedPeer runs the same key validation as startup, without
-// exposing the peer to concurrent establishment workers.
-func (s *Server) ValidateAuthorizedPeer(ip netip.Addr, key PublicKey) error {
+// ValidatePeerIdentity checks one configured identity without consulting the
+// current authorization registry. Bulk reconciliation uses it before mutating
+// any runtime state, where conflicts with the old snapshot are intentionally
+// irrelevant.
+func (s *Server) ValidatePeerIdentity(ip netip.Addr, key PublicKey) error {
 	ip = ip.Unmap()
 	if err := coreserver.ValidateTunnelIPv4(ip); err != nil {
 		return fmt.Errorf("invalid tunnel IPv4: %w", ErrInvalidState)
 	}
 	if _, err := noiseCipherSuite.DH(s.staticPrivateKey[:], key[:]); err != nil {
 		return fmt.Errorf("invalid client public key: %w", ErrInvalidKey)
+	}
+	return nil
+}
+
+// ValidateAuthorizedPeer runs the same key validation as startup, without
+// exposing the peer to concurrent establishment workers.
+func (s *Server) ValidateAuthorizedPeer(ip netip.Addr, key PublicKey) error {
+	ip = ip.Unmap()
+	if err := s.ValidatePeerIdentity(ip, key); err != nil {
+		return err
 	}
 	s.peersMu.RLock()
 	defer s.peersMu.RUnlock()
@@ -99,4 +111,47 @@ func (s *Server) RemoveAuthorizedPeer(key PublicKey) {
 		delete(s.peers, key)
 	}
 	s.peersMu.Unlock()
+}
+
+// AuthorizedPeerBinding is one already-prepared runtime authorization target.
+// It deliberately carries no persistence/provisioning metadata.
+type AuthorizedPeerBinding struct {
+	TunnelIPv4 netip.Addr
+	CorePeer   *coreserver.Peer
+}
+
+// ReplaceAuthorizedPeers swaps the complete authorization snapshot. Existing
+// public-key state is reused so freshness history survives address changes. An
+// exact binding keeps the same immutable binding pointer as well, so an
+// unrelated sync cannot invalidate an in-flight handshake for an unchanged
+// peer. Removed states have their binding cleared before leaving the registry.
+//
+// The caller owns validation and must publish the referenced Core peers first.
+// This function intentionally has no recoverable failure path after the Core
+// snapshot has committed.
+func (s *Server) ReplaceAuthorizedPeers(peers map[PublicKey]AuthorizedPeerBinding) {
+	s.peersMu.Lock()
+	defer s.peersMu.Unlock()
+
+	next := make(map[PublicKey]*serverPeerState, len(peers))
+	for key, target := range peers {
+		state := s.peers[key]
+		if state == nil {
+			state = &serverPeerState{}
+		}
+
+		ip := target.TunnelIPv4.Unmap()
+		current := state.binding.Load()
+		if current == nil || current.tunnelIPv4 != ip || current.corePeer != target.CorePeer {
+			state.binding.Store(&serverPeerBinding{tunnelIPv4: ip, corePeer: target.CorePeer})
+		}
+		next[key] = state
+	}
+
+	for key, state := range s.peers {
+		if _, kept := next[key]; !kept {
+			state.binding.Store(nil)
+		}
+	}
+	s.peers = next
 }

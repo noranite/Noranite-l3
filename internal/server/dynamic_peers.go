@@ -55,6 +55,79 @@ func (c *Core) PublishPeer(ip netip.Addr, peer *Peer) error {
 	return nil
 }
 
+// ReplacePeers swaps the complete live peer registry in one control-plane
+// transaction. A Peer pointer that remains at the same tunnel address keeps
+// all of its session/lifecycle state. Every old Peer absent from the new
+// snapshot is revoked and loses its session IDs before the snapshot is exposed.
+//
+// Callers must prepare/register new Peer objects before this call. The input map
+// is copied, so subsequent caller mutation cannot affect the live registry.
+func (c *Core) ReplacePeers(peers map[netip.Addr]*Peer) error {
+	next := make(map[netip.Addr]*Peer, len(peers))
+	nextAddressByPeer := make(map[*Peer]netip.Addr, len(peers))
+	for ip, peer := range peers {
+		ip = ip.Unmap()
+		if err := ValidateTunnelIPv4(ip); err != nil {
+			return err
+		}
+		if peer == nil || peer.IsRevoked() {
+			return fmt.Errorf("invalid peer for tunnel IPv4 %s: %w", ip, dataplane.ErrInvalidConfig)
+		}
+		if previousIP, exists := nextAddressByPeer[peer]; exists {
+			return fmt.Errorf(
+				"peer reused for tunnel IPv4 %s and %s: %w",
+				previousIP, ip, dataplane.ErrInvalidConfig,
+			)
+		}
+		next[ip] = peer
+		nextAddressByPeer[peer] = ip
+	}
+
+	c.peerEditMu.Lock()
+	defer c.peerEditMu.Unlock()
+
+	old := c.peerSnapshots.Load()
+	if old == nil {
+		return fmt.Errorf("peer registry is not initialized: %w", dataplane.ErrInvalidConfig)
+	}
+	for ip, peer := range next {
+		if peer.IsRevoked() {
+			return fmt.Errorf("revoked peer for tunnel IPv4 %s: %w", ip, dataplane.ErrInvalidConfig)
+		}
+	}
+
+	// Reusing a Peer at a different address would preserve sessions whose
+	// recorded tunnel identity still points at the old address. Require callers
+	// to use a fresh Peer object for every changed binding instead.
+	for oldIP, peer := range *old {
+		if newIP, kept := nextAddressByPeer[peer]; kept && newIP != oldIP {
+			return fmt.Errorf(
+				"existing peer moved from %s to %s: %w",
+				oldIP, newIP, dataplane.ErrInvalidConfig,
+			)
+		}
+	}
+
+	// Lock order matches RevokePeer: peerEditMu -> sessionsMu -> Peer.mu.
+	c.sessionsMu.Lock()
+	retired := make(map[*Peer]struct{})
+	for _, peer := range *old {
+		if _, kept := nextAddressByPeer[peer]; kept {
+			continue
+		}
+		peer.revoke()
+		retired[peer] = struct{}{}
+	}
+	for id, binding := range c.sessionsByID {
+		if _, remove := retired[binding.peer]; remove {
+			delete(c.sessionsByID, id)
+		}
+	}
+	c.peerSnapshots.Store(&next)
+	c.sessionsMu.Unlock()
+	return nil
+}
+
 // RevokePeer invalidates the registry identity and all session IDs. Operations
 // already admitted into a worker may finish using their retained pointers.
 func (c *Core) RevokePeer(ip netip.Addr, expected *Peer) error {

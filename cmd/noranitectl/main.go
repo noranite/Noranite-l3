@@ -8,6 +8,7 @@ import (
 	"os"
 	"text/tabwriter"
 
+	"github.com/noranite/Noranite-l3/internal/peerstore"
 	"github.com/noranite/Noranite-l3/internal/servercontrol"
 )
 
@@ -27,7 +28,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 	args = root.Args()
 	if len(args) < 2 || args[0] != "peer" {
-		return errors.New("usage: noranitectl [-socket path] peer {list|set|remove} [options]")
+		return errors.New("usage: noranitectl [-socket path] peer {list|set|remove|sync} [options]")
 	}
 
 	switch args[1] {
@@ -88,6 +89,40 @@ func run(args []string, stdout, stderr io.Writer) error {
 		response, err := servercontrol.Do(*socket, servercontrol.Request{
 			Operation: servercontrol.OperationPeerRemove,
 			PublicKey: *publicKey,
+		})
+		if err != nil {
+			return err
+		}
+		if !response.OK {
+			return errors.New(response.Error)
+		}
+		return nil
+
+	case "sync":
+		flags := flag.NewFlagSet("peer sync", flag.ContinueOnError)
+		flags.SetOutput(stderr)
+		file := flags.String("file", "", "persistent peer configuration file")
+		if err := flags.Parse(args[2:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 || *file == "" {
+			return errors.New("usage: noranitectl [-socket path] peer sync --file FILE")
+		}
+
+		records, err := peerstore.Load(*file)
+		if err != nil {
+			return err
+		}
+		peers := make([]servercontrol.WirePeer, 0, len(records))
+		for _, record := range records {
+			peers = append(peers, servercontrol.WirePeer{
+				IP:        record.TunnelIPv4.String(),
+				PublicKey: servercontrol.EncodePublicKey(record.PublicKey),
+			})
+		}
+		response, err := servercontrol.Do(*socket, servercontrol.Request{
+			Operation: servercontrol.OperationPeerSync,
+			Peers:     &peers,
 		})
 		if err != nil {
 			return err

@@ -20,9 +20,10 @@ import (
 
 const (
 	DefaultSocketPath       = "/run/noranite/control.sock"
-	maxRequestBytes         = 64 << 10
+	maxRequestBytes         = 4 << 20
 	maxResponseBytes        = 4 << 20
-	requestTimeout          = 5 * time.Second
+	requestIOTimeout        = 5 * time.Second
+	peerSyncTimeout         = time.Minute
 	staleSocketProbeTimeout = 250 * time.Millisecond
 )
 
@@ -30,6 +31,7 @@ const (
 	OperationPeerList   = "peer.list"
 	OperationPeerSet    = "peer.set"
 	OperationPeerRemove = "peer.remove"
+	OperationPeerSync   = "peer.sync"
 )
 
 const ErrorCodePeerConflict = "peer_conflict"
@@ -40,9 +42,10 @@ type WirePeer struct {
 }
 
 type Request struct {
-	Operation string    `json:"op"`
-	Peer      *WirePeer `json:"peer,omitempty"`
-	PublicKey string    `json:"public_key,omitempty"`
+	Operation string      `json:"op"`
+	Peer      *WirePeer   `json:"peer,omitempty"`
+	Peers     *[]WirePeer `json:"peers,omitempty"`
+	PublicKey string      `json:"public_key,omitempty"`
 }
 
 type Response struct {
@@ -154,7 +157,9 @@ func (s *UnixServer) handleConn(conn net.Conn) {
 		s.mu.Unlock()
 		_ = conn.Close()
 	}()
-	_ = conn.SetDeadline(time.Now().Add(requestTimeout))
+	deadline := time.Now().Add(requestIOTimeout)
+	_ = conn.SetReadDeadline(deadline)
+	_ = conn.SetWriteDeadline(deadline)
 
 	reader := bufio.NewReaderSize(conn, maxRequestBytes+1)
 	line, err := reader.ReadSlice('\n')
@@ -177,7 +182,9 @@ func (s *UnixServer) handleConn(conn net.Conn) {
 		_ = json.NewEncoder(conn).Encode(Response{OK: false, Error: "request must contain one JSON value"})
 		return
 	}
+	_ = conn.SetReadDeadline(time.Time{})
 	response := s.execute(req)
+	_ = conn.SetWriteDeadline(time.Now().Add(requestIOTimeout))
 	_ = json.NewEncoder(conn).Encode(response)
 }
 
@@ -217,6 +224,23 @@ func (s *UnixServer) execute(req Request) Response {
 		}
 		return Response{OK: true}
 
+	case OperationPeerSync:
+		if req.Peers == nil {
+			return responseError(fmt.Errorf("peer.sync requires peers snapshot"))
+		}
+		peers := make([]Peer, 0, len(*req.Peers))
+		for i, wire := range *req.Peers {
+			peer, err := parseWirePeer(wire)
+			if err != nil {
+				return responseError(fmt.Errorf("peer.sync peer %d: %w", i, err))
+			}
+			peers = append(peers, peer)
+		}
+		if err := s.controller.SyncPeers(peers); err != nil {
+			return responseError(err)
+		}
+		return Response{OK: true}
+
 	default:
 		return responseError(fmt.Errorf("unknown operation %q", req.Operation))
 	}
@@ -248,20 +272,31 @@ func (s *UnixServer) Close() {
 }
 
 func Do(path string, request Request) (Response, error) {
-	conn, err := net.DialTimeout("unix", path, requestTimeout)
+	conn, err := net.DialTimeout("unix", path, requestIOTimeout)
 	if err != nil {
 		return Response{}, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(requestTimeout))
+
+	_ = conn.SetWriteDeadline(time.Now().Add(requestIOTimeout))
 	if err := json.NewEncoder(conn).Encode(request); err != nil {
 		return Response{}, err
 	}
+	_ = conn.SetWriteDeadline(time.Time{})
+	_ = conn.SetReadDeadline(time.Now().Add(responseTimeout(request.Operation)))
+
 	var response Response
 	if err := json.NewDecoder(io.LimitReader(conn, maxResponseBytes)).Decode(&response); err != nil {
 		return Response{}, err
 	}
 	return response, nil
+}
+
+func responseTimeout(operation string) time.Duration {
+	if operation == OperationPeerSync {
+		return peerSyncTimeout
+	}
+	return requestIOTimeout
 }
 
 func wirePeer(peer Peer) WirePeer {

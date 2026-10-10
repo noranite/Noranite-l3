@@ -102,6 +102,97 @@ func (c *Controller) SetPeer(peer Peer) error {
 	return c.replacePeerLocked(existing, peer)
 }
 
+// SyncPeers replaces the complete runtime peer configuration with desired.
+// Exact key+address matches reuse their existing Core Peer and therefore keep
+// sessions intact. Every other desired binding gets a fresh Core Peer.
+//
+// All validation and resource preparation happens before the Core snapshot is
+// committed. After that commit the remaining swaps are deliberately infallible
+// and forward-only.
+func (c *Controller) SyncPeers(desired []Peer) error {
+	normalized := make([]Peer, len(desired))
+	seenKeys := make(map[noisehandshake.PublicKey]struct{}, len(desired))
+	seenIPs := make(map[netip.Addr]struct{}, len(desired))
+	for i, peer := range desired {
+		peer.TunnelIPv4 = peer.TunnelIPv4.Unmap()
+		if err := c.noise.ValidatePeerIdentity(peer.TunnelIPv4, peer.PublicKey); err != nil {
+			return fmt.Errorf("peer %d: %w", i, err)
+		}
+		if _, exists := seenKeys[peer.PublicKey]; exists {
+			return fmt.Errorf("peer %d duplicates public key: %w", i, ErrPeerConflict)
+		}
+		if _, exists := seenIPs[peer.TunnelIPv4]; exists {
+			return fmt.Errorf("peer %d duplicates tunnel IPv4 %s: %w", i, peer.TunnelIPv4, ErrPeerConflict)
+		}
+		seenKeys[peer.PublicKey] = struct{}{}
+		seenIPs[peer.TunnelIPv4] = struct{}{}
+		normalized[i] = peer
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return ErrControllerClosed
+	}
+
+	nextByKey := make(map[noisehandshake.PublicKey]*peerState, len(normalized))
+	nextByIP := make(map[netip.Addr]*peerState, len(normalized))
+	nextCore := make(map[netip.Addr]*server.Peer, len(normalized))
+	nextNoise := make(map[noisehandshake.PublicKey]noisehandshake.AuthorizedPeerBinding, len(normalized))
+	prepared := make([]*server.Peer, 0, len(normalized))
+
+	discardPrepared := func() {
+		for _, peer := range prepared {
+			c.retirePeerLocked(peer)
+		}
+	}
+
+	for _, peer := range normalized {
+		state := c.byKey[peer.PublicKey]
+		if state == nil ||
+			state.TunnelIPv4 != peer.TunnelIPv4 ||
+			state.corePeer == nil ||
+			state.corePeer.IsRevoked() ||
+			c.core.PeerForIP(peer.TunnelIPv4) != state.corePeer {
+			corePeer, err := c.preparePeerLocked()
+			if err != nil {
+				discardPrepared()
+				return err
+			}
+			prepared = append(prepared, corePeer)
+			state = &peerState{Peer: peer, corePeer: corePeer}
+		}
+
+		nextByKey[peer.PublicKey] = state
+		nextByIP[peer.TunnelIPv4] = state
+		nextCore[peer.TunnelIPv4] = state.corePeer
+		nextNoise[peer.PublicKey] = noisehandshake.AuthorizedPeerBinding{
+			TunnelIPv4: peer.TunnelIPv4,
+			CorePeer:   state.corePeer,
+		}
+	}
+
+	if err := c.core.ReplacePeers(nextCore); err != nil {
+		discardPrepared()
+		return err
+	}
+
+	// Core has committed. Old Noise bindings now fail closed because their exact
+	// Core Peer pointers were revoked. Replace the authorization snapshot next,
+	// then publish the matching administrative indexes.
+	c.noise.ReplaceAuthorizedPeers(nextNoise)
+	oldByKey := c.byKey
+	c.byKey = nextByKey
+	c.byIP = nextByIP
+
+	for key, old := range oldByKey {
+		if nextByKey[key] != old {
+			c.retirePeerLocked(old.corePeer)
+		}
+	}
+	return nil
+}
+
 func (c *Controller) addPeerLocked(peer Peer) error {
 	if err := c.noise.ValidateAuthorizedPeer(peer.TunnelIPv4, peer.PublicKey); err != nil {
 		return err

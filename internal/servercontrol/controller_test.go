@@ -136,6 +136,12 @@ func TestControllerCloseRejectsMutation(t *testing.T) {
 
 func newTestController(t *testing.T) (*Controller, *server.Core, *server.RXEngine, *server.TXEngine) {
 	t.Helper()
+	controller, core, _, rx, tx := newTestControllerWithNoise(t)
+	return controller, core, rx, tx
+}
+
+func newTestControllerWithNoise(t *testing.T) (*Controller, *server.Core, *noisehandshake.Server, *server.RXEngine, *server.TXEngine) {
+	t.Helper()
 	core, err := server.New(server.Config{
 		MaxInnerPacketSize: dataplane.ReferenceTunnelMTU,
 		Lifecycle: server.LifecycleConfig{
@@ -172,7 +178,7 @@ func newTestController(t *testing.T) (*Controller, *server.Core, *server.RXEngin
 		tx.Close()
 		t.Fatal(err)
 	}
-	return controller, core, rx, tx
+	return controller, core, noiseServer, rx, tx
 }
 
 func testPublicKey(t *testing.T, seed byte) noisehandshake.PublicKey {
