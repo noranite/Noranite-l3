@@ -15,6 +15,9 @@ TUNNEL_ADDRESS="10.66.0.1/16"
 BIND_ADDRESS="0.0.0.0:41675"
 MTU="1380"
 LOCAL_ACCESS="deny"
+ROUTE_KEY=""
+SERVER_PRIVATE_KEY=""
+SERVER_PUBLIC_KEY=""
 NETWORK_OPTION_SEEN=0
 FIRST_INSTALL=0
 
@@ -23,7 +26,7 @@ usage() {
 usage: $0 [options]
 
 Installs a Noranite server from prebuilt binaries in ./bin.
-Existing /etc/noranite/server.env and keys are preserved on upgrade.
+Existing /etc/noranite/server.env is preserved on upgrade. Existing keys are preserved unless an explicit complete key set is supplied.
 
 options:
   --bin-dir DIR              directory containing built Noranite binaries
@@ -32,6 +35,11 @@ options:
   --bind IPv4:PORT           UDP listen address (default: 0.0.0.0:41675)
   --mtu MTU                  tunnel MTU (default: 1380)
   --local-access MODE        local/LAN access: deny or allow (default: deny)
+  --route-key BASE64         32-byte route key in standard Base64
+  --server-private-key BASE64
+                              32-byte server X25519 private key in standard Base64
+  --server-public-key BASE64
+                              32-byte server X25519 public key in standard Base64
   -h, --help                 show this help
 USAGE
 }
@@ -67,6 +75,18 @@ while (($#)); do
 			NETWORK_OPTION_SEEN=1
 			shift 2
 			;;
+		--route-key)
+			ROUTE_KEY="$2"
+			shift 2
+			;;
+		--server-private-key)
+			SERVER_PRIVATE_KEY="$2"
+			shift 2
+			;;
+		--server-public-key)
+			SERVER_PUBLIC_KEY="$2"
+			shift 2
+			;;
 		-h|--help)
 			usage
 			exit 0
@@ -78,6 +98,34 @@ while (($#)); do
 			;;
 	esac
 done
+
+
+validate_key32() {
+	local option_name="$1"
+	local value="$2"
+
+	# Standard Base64 for exactly 32 bytes is always 44 characters with one '=' padding byte.
+	if [[ ! "${value}" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+		echo "error: ${option_name} must be standard Base64 encoding exactly 32 bytes" >&2
+		exit 2
+	fi
+}
+
+key_option_count=0
+[[ -n "${ROUTE_KEY}" ]] && ((key_option_count += 1))
+[[ -n "${SERVER_PRIVATE_KEY}" ]] && ((key_option_count += 1))
+[[ -n "${SERVER_PUBLIC_KEY}" ]] && ((key_option_count += 1))
+
+if (( key_option_count != 0 && key_option_count != 3 )); then
+	echo "error: --route-key, --server-private-key and --server-public-key must be supplied together" >&2
+	exit 2
+fi
+
+if (( key_option_count == 3 )); then
+	validate_key32 --route-key "${ROUTE_KEY}"
+	validate_key32 --server-private-key "${SERVER_PRIVATE_KEY}"
+	validate_key32 --server-public-key "${SERVER_PUBLIC_KEY}"
+fi
 
 case "${LOCAL_ACCESS}" in
 	deny|allow) ;;
@@ -92,7 +140,7 @@ if (( EUID != 0 )); then
 	exit 1
 fi
 
-for command_name in install ip iptables sysctl systemctl awk head base64 tr; do
+for command_name in install ip iptables sysctl systemctl awk tr; do
 	if ! command -v "${command_name}" >/dev/null 2>&1; then
 		echo "error: required command not found: ${command_name}" >&2
 		exit 1
@@ -115,6 +163,11 @@ if [[ ! -e "${CONFIG_FILE}" ]]; then
 	FIRST_INSTALL=1
 fi
 
+if (( FIRST_INSTALL && key_option_count != 3 )); then
+	echo "error: first install requires --route-key, --server-private-key and --server-public-key" >&2
+	exit 2
+fi
+
 install -d -m 0700 "${CONFIG_DIR}"
 install -d -m 0755 /usr/local/bin
 install -d -m 0755 "${LIBEXEC_DIR}"
@@ -123,6 +176,7 @@ install -m 0755 "${BIN_DIR}/opaque-server" /usr/local/bin/opaque-server
 install -m 0755 "${BIN_DIR}/noranitectl" /usr/local/bin/noranitectl
 install -m 0755 "${BIN_DIR}/noranite-peer" /usr/local/bin/noranite-peer
 install -m 0755 "${BIN_DIR}/opaque-keygen" /usr/local/bin/opaque-keygen
+install -m 0755 "${ROOT_DIR}/uninstall" /usr/local/bin/noranite-uninstall
 install -m 0755 "${SCRIPT_DIR}/network.sh" "${LIBEXEC_DIR}/server-network"
 install -m 0644 "${SCRIPT_DIR}/noranite-server-network.service" "${SYSTEMD_DIR}/noranite-server-network.service"
 install -m 0644 "${SCRIPT_DIR}/noranite-server.service" "${SYSTEMD_DIR}/noranite-server.service"
@@ -156,20 +210,22 @@ CONFIG
 	echo "created ${CONFIG_FILE}"
 fi
 
-if [[ ! -e "${CONFIG_DIR}/route.key" ]]; then
+if (( key_option_count == 3 )); then
 	umask 077
-	head -c 32 /dev/urandom | base64 >"${CONFIG_DIR}/route.key"
-	echo "generated ${CONFIG_DIR}/route.key"
-fi
-
-if [[ ! -e "${CONFIG_DIR}/server.private" ]]; then
-	/usr/local/bin/opaque-keygen \
-		-private-out "${CONFIG_DIR}/server.private" \
-		-public-out "${CONFIG_DIR}/server.public" \
-		>/dev/null
-	echo "generated server keypair"
-elif [[ ! -e "${CONFIG_DIR}/server.public" ]]; then
-	echo "warning: server.private exists but server.public is missing; private key was preserved" >&2
+	printf '%s\n' "${ROUTE_KEY}" >"${CONFIG_DIR}/route.key"
+	printf '%s\n' "${SERVER_PRIVATE_KEY}" >"${CONFIG_DIR}/server.private"
+	printf '%s\n' "${SERVER_PUBLIC_KEY}" >"${CONFIG_DIR}/server.public"
+	chmod 0600 "${CONFIG_DIR}/route.key" "${CONFIG_DIR}/server.private"
+	chmod 0644 "${CONFIG_DIR}/server.public"
+	echo "installed supplied route key and server keypair"
+else
+	for key_file in route.key server.private server.public; do
+		if [[ ! -r "${CONFIG_DIR}/${key_file}" ]]; then
+			echo "error: existing installation is missing ${CONFIG_DIR}/${key_file}; supply a complete key set" >&2
+			exit 1
+		fi
+	done
+	echo "preserving existing route key and server keypair"
 fi
 
 if [[ ! -e "${CONFIG_DIR}/server.peers" ]]; then

@@ -2,7 +2,7 @@
 
 ## Installation and administration
 
-The server installer targets Linux systems using systemd and `iptables`. It installs prebuilt binaries from `./bin`, creates keys and configuration under `/etc/noranite`, configures `nrnt0`, forwarding/NAT, and starts the service.
+The server installer targets Linux systems using systemd and `iptables`. It installs prebuilt binaries from `./bin`, writes configuration and caller-supplied server keys under `/etc/noranite`, configures `nrnt0`, forwarding/NAT, and starts the service.
 
 On Debian/Ubuntu, the server can be installed with a single command:
 
@@ -10,7 +10,9 @@ On Debian/Ubuntu, the server can be installed with a single command:
 curl -fsSL https://raw.githubusercontent.com/noranite/Noranite-l3/main/quick-install | sudo bash
 ```
 
-The quick installer downloads the source from GitHub into a temporary directory, uses a temporary Go toolchain of the required version when necessary, builds the server binaries, and runs the standard installer. On first install it automatically detects the Internet-facing interface and asks for the tunnel address, UDP port, MTU (1380 or lower is recommended), and local-network access mode. On subsequent runs, existing `/etc/noranite/server.env`, keys, and peers are preserved.
+The quick installer downloads the source from GitHub into a temporary directory, uses a temporary Go toolchain of the required version when necessary, builds the server binaries, and runs the standard installer. On first install it automatically detects the Internet-facing interface, asks for the tunnel address, UDP port, MTU (1380 or lower is recommended), and local-network access mode, and generates the route key and server X25519 keypair. On subsequent ordinary runs, existing `/etc/noranite/server.env`, keys, and peers are preserved.
+
+For machine provisioning, `quick-install` also accepts a complete caller-managed key set through `NORANITE_ROUTE_KEY`, `NORANITE_SERVER_PRIVATE_KEY`, and `NORANITE_SERVER_PUBLIC_KEY`. The three variables must be supplied together; when present, those keys become the desired server identity.
 
 For a manual installation, first build the required binaries from the repository root:
 
@@ -22,13 +24,16 @@ go build -o bin/noranite-peer ./cmd/noranite-peer
 go build -o bin/opaque-keygen ./cmd/opaque-keygen
 ```
 
-Basic installation:
+`install/server/install.sh` is the low-level machine-oriented installer. On first install it requires the route key and server X25519 keypair from the caller:
 
 ```bash
-sudo ./install/server/install.sh
+sudo ./install/server/install.sh \
+  --route-key ROUTE_KEY_BASE64 \
+  --server-private-key SERVER_PRIVATE_KEY_BASE64 \
+  --server-public-key SERVER_PUBLIC_KEY_BASE64
 ```
 
-The defaults are tunnel `10.66.0.1/16`, UDP bind `0.0.0.0:41675`, and MTU `1380`; the Internet-facing interface is detected from the default route. On first install, the main parameters can be specified explicitly:
+The defaults are tunnel `10.66.0.1/16`, UDP bind `0.0.0.0:41675`, and MTU `1380`; the Internet-facing interface is detected from the default route. The network parameters can be specified explicitly on first install:
 
 ```bash
 sudo ./install/server/install.sh \
@@ -36,8 +41,13 @@ sudo ./install/server/install.sh \
   --tunnel-address 10.66.0.1/16 \
   --bind 0.0.0.0:41675 \
   --mtu 1380 \
-  --local-access deny
+  --local-access deny \
+  --route-key ROUTE_KEY_BASE64 \
+  --server-private-key SERVER_PRIVATE_KEY_BASE64 \
+  --server-public-key SERVER_PUBLIC_KEY_BASE64
 ```
+
+Supplying the complete key set again replaces the installed server identity. Omitting all three key options on an existing installation preserves the existing identity.
 
 `--local-access deny` is the default: VPN peers receive Internet egress but cannot access the VPN server itself or local networks. `--local-access allow` removes this additional isolation; further access is then controlled by the host's own routing and firewall configuration.
 
@@ -63,10 +73,10 @@ sudo journalctl -u noranite-server -f
 To completely remove the server, including keys, persistent peers, systemd units, firewall rules, and installed binaries:
 
 ```bash
-sudo ./uninstall
+sudo noranite-uninstall
 ```
 
-`uninstall` asks for explicit confirmation before removing `/etc/noranite`. For non-interactive use, run `sudo ./uninstall --yes`. It does not remove OS packages that may have existed before Noranite or may be used by other software.
+The repository-local `sudo ./uninstall` entry point remains equivalent. The uninstaller asks for explicit confirmation before removing `/etc/noranite`. For non-interactive or machine use, run `sudo noranite-uninstall --yes`. It does not remove OS packages that may have existed before Noranite or may be used by other software.
 
 ### Peers
 

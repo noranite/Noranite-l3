@@ -102,6 +102,7 @@ rm -f \
 	/usr/local/bin/noranitectl \
 	/usr/local/bin/noranite-peer \
 	/usr/local/bin/opaque-keygen \
+	/usr/local/bin/noranite-uninstall \
 	"${SYSTEMD_DIR}/noranite-server.service" \
 	"${SYSTEMD_DIR}/noranite-server-network.service"
 rm -rf "${LIBEXEC_DIR}" "${CONFIG_DIR}" /run/noranite

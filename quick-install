@@ -11,6 +11,9 @@ MTU="${NORANITE_MTU:-1380}"
 LOCAL_ACCESS="${NORANITE_LOCAL_ACCESS:-deny}"
 EGRESS_IFACE=""
 NONINTERACTIVE="${NORANITE_NONINTERACTIVE:-0}"
+ROUTE_KEY="${NORANITE_ROUTE_KEY:-}"
+SERVER_PRIVATE_KEY="${NORANITE_SERVER_PRIVATE_KEY:-}"
+SERVER_PUBLIC_KEY="${NORANITE_SERVER_PUBLIC_KEY:-}"
 
 TMP_DIR=""
 
@@ -134,10 +137,22 @@ validate_first_install_options() {
 	ip link show dev "${EGRESS_IFACE}" >/dev/null 2>&1 || fail "network interface does not exist: ${EGRESS_IFACE}"
 }
 
+validate_supplied_keys() {
+	local count=0
+	[[ -n "${ROUTE_KEY}" ]] && ((count += 1))
+	[[ -n "${SERVER_PRIVATE_KEY}" ]] && ((count += 1))
+	[[ -n "${SERVER_PUBLIC_KEY}" ]] && ((count += 1))
+
+	if (( count != 0 && count != 3 )); then
+		fail "NORANITE_ROUTE_KEY, NORANITE_SERVER_PRIVATE_KEY and NORANITE_SERVER_PUBLIC_KEY must be supplied together"
+	fi
+}
+
 if (( EUID != 0 )); then
 	fail "run quick-install as root (for example: curl ... | sudo bash)"
 fi
 
+validate_supplied_keys
 install_dependencies_if_needed
 
 command -v systemctl >/dev/null 2>&1 || fail "systemctl is required; this installer targets systemd-based Linux servers"
@@ -160,7 +175,7 @@ if [[ ! -e "${CONFIG_FILE}" ]]; then
 	fi
 	validate_first_install_options
 else
-	echo "Existing ${CONFIG_FILE} detected; network settings and keys will be preserved."
+	echo "Existing ${CONFIG_FILE} detected; network settings will be preserved."
 fi
 
 TMP_DIR="$(mktemp -d -t noranite-install.XXXXXXXX)"
@@ -189,6 +204,16 @@ echo "Building Noranite..."
 	CGO_ENABLED=0 "${GO_BIN}" build -trimpath -o bin/opaque-keygen ./cmd/opaque-keygen
 )
 
+if [[ ! -e "${CONFIG_FILE}" && -z "${ROUTE_KEY}" ]]; then
+	echo "Generating server keys..."
+	ROUTE_KEY="$(head -c 32 /dev/urandom | base64 | tr -d '\r\n')"
+	KEYPAIR_OUTPUT="$("${SOURCE_DIR}/bin/opaque-keygen")"
+	SERVER_PRIVATE_KEY="$(printf '%s\n' "${KEYPAIR_OUTPUT}" | awk '/^private=/{sub(/^private=/, ""); print; exit}')"
+	SERVER_PUBLIC_KEY="$(printf '%s\n' "${KEYPAIR_OUTPUT}" | awk '/^public=/{sub(/^public=/, ""); print; exit}')"
+
+	[[ -n "${SERVER_PRIVATE_KEY}" && -n "${SERVER_PUBLIC_KEY}" ]] || fail "opaque-keygen did not return a complete server keypair"
+fi
+
 install_args=(--bin-dir "${SOURCE_DIR}/bin")
 if [[ ! -e "${CONFIG_FILE}" ]]; then
 	install_args+=(
@@ -197,6 +222,14 @@ if [[ ! -e "${CONFIG_FILE}" ]]; then
 		--bind "0.0.0.0:${UDP_PORT}"
 		--mtu "${MTU}"
 		--local-access "${LOCAL_ACCESS}"
+	)
+fi
+
+if [[ -n "${ROUTE_KEY}" ]]; then
+	install_args+=(
+		--route-key "${ROUTE_KEY}"
+		--server-private-key "${SERVER_PRIVATE_KEY}"
+		--server-public-key "${SERVER_PUBLIC_KEY}"
 	)
 fi
 
