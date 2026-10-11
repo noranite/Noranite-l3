@@ -27,10 +27,6 @@ type ClientDatagramDemux interface {
 	) (handled bool, err error)
 }
 
-type ClientAuthenticatedEventSink interface {
-	HandleAuthenticatedACK(keepaliveID uint64)
-}
-
 type ClientDatagramDemuxFunc func(
 	source netip.AddrPort,
 	route dataplane.Route,

@@ -1171,8 +1171,9 @@ func TestClientSessionControllerColdStartInstallsAndActivatesFirstGeneration(t *
 		t.Fatal("client runtime did not become ready")
 	}
 
-	// With no initial Session, controller must begin establishment immediately;
-	// no external RequestRekey/bootstrap path is required.
+	// The standalone prototype runtime has no application-demand hook. Bootstrap
+	// it explicitly; production embedded clients activate from first DATA.
+	controller.RequestRekey()
 	if err := serverConn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
 		t.Fatalf("SetReadDeadline(establishment): %v", err)
 	}

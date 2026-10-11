@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/noranite/Noranite-l3/internal/dataplane"
 )
@@ -66,5 +67,21 @@ func TestNewClientMTUBounds(t *testing.T) {
 				t.Fatalf("NewClient = (%v, %v), want nil, ErrInvalidConfig", client, err)
 			}
 		})
+	}
+}
+
+func TestNewClientRejectsNegativePersistentKeepalive(t *testing.T) {
+	device := newTestPacketDevice()
+	defer device.Close()
+
+	config := testPublicClientConfig(t, DefaultMTU)
+	config.PersistentKeepalive = -time.Second
+
+	client, err := NewClient(config, device, nil)
+	if client != nil {
+		defer client.Close()
+	}
+	if client != nil || !errors.Is(err, dataplane.ErrInvalidConfig) {
+		t.Fatalf("NewClient = (%v, %v), want nil, ErrInvalidConfig", client, err)
 	}
 }

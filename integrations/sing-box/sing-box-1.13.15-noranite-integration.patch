@@ -80,19 +80,20 @@ new file mode 100644
 index 0000000..0dffff2
 --- /dev/null
 +++ b/option/noranite.go
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,15 @@
 +package option
 +
 +import "net/netip"
 +
 +type NoraniteEndpointOptions struct {
-+	Server          netip.Addr `json:"server"`
-+	ServerPort      uint16     `json:"server_port"`
-+	Address         netip.Addr `json:"address"`
-+	MTU             uint32     `json:"mtu,omitempty"`
-+	RouteKey        string     `json:"route_key"`
-+	PrivateKey      string     `json:"private_key"`
-+	ServerPublicKey string     `json:"server_public_key"`
++	Server                      netip.Addr `json:"server"`
++	ServerPort                  uint16     `json:"server_port"`
++	Address                     netip.Addr `json:"address"`
++	MTU                         uint32     `json:"mtu,omitempty"`
++	RouteKey                    string     `json:"route_key"`
++	PrivateKey                  string     `json:"private_key"`
++	ServerPublicKey             string     `json:"server_public_key"`
++	PersistentKeepaliveInterval uint16     `json:"persistent_keepalive_interval,omitempty"`
 +	DialerOptions
 +}
 diff --git a/protocol/noranite/endpoint.go b/protocol/noranite/endpoint.go
@@ -100,7 +101,7 @@ new file mode 100644
 index 0000000..ddf75b6
 --- /dev/null
 +++ b/protocol/noranite/endpoint.go
-@@ -0,0 +1,541 @@
+@@ -0,0 +1,561 @@
 +//go:build with_noranite
 +
 +package noranite
@@ -135,7 +136,10 @@ index 0000000..ddf75b6
 +	"github.com/sagernet/sing/service/pause"
 +)
 +
-+const transportRedialDelay = time.Second
++const (
++	transportRedialDelayMin = time.Second
++	transportRedialDelayMax = 30 * time.Second
++)
 +
 +var (
 +	_ adapter.Endpoint                   = (*Endpoint)(nil)
@@ -154,12 +158,13 @@ index 0000000..ddf75b6
 +	outboundDialer N.Dialer
 +	pauseManager   pause.Manager
 +
-+	serverEndpoint  netip.AddrPort
-+	tunnelIPv4      netip.Addr
-+	mtu             int
-+	routeKey        [32]byte
-+	privateKey      [32]byte
-+	serverPublicKey [32]byte
++	serverEndpoint      netip.AddrPort
++	tunnelIPv4          netip.Addr
++	mtu                 int
++	persistentKeepalive time.Duration
++	routeKey            [32]byte
++	privateKey          [32]byte
++	serverPublicKey     [32]byte
 +
 +	lifecycleMu sync.Mutex
 +	device      wireguard.Device
@@ -228,18 +233,19 @@ index 0000000..ddf75b6
 +			[]string{N.NetworkTCP, N.NetworkUDP},
 +			options.DialerOptions,
 +		),
-+		ctx:             ctx,
-+		dnsRouter:       service.FromContext[adapter.DNSRouter](ctx),
-+		logger:          logger,
-+		outboundDialer:  outboundDialer,
-+		pauseManager:    service.FromContext[pause.Manager](ctx),
-+		serverEndpoint:  netip.AddrPortFrom(server, options.ServerPort),
-+		transportWake:   make(chan struct{}, 1),
-+		tunnelIPv4:      tunnelIPv4,
-+		mtu:             mtu,
-+		routeKey:        routeKey,
-+		privateKey:      privateKey,
-+		serverPublicKey: serverPublicKey,
++		ctx:                 ctx,
++		dnsRouter:           service.FromContext[adapter.DNSRouter](ctx),
++		logger:              logger,
++		outboundDialer:      outboundDialer,
++		pauseManager:        service.FromContext[pause.Manager](ctx),
++		serverEndpoint:      netip.AddrPortFrom(server, options.ServerPort),
++		transportWake:       make(chan struct{}, 1),
++		tunnelIPv4:          tunnelIPv4,
++		mtu:                 mtu,
++		persistentKeepalive: time.Duration(options.PersistentKeepaliveInterval) * time.Second,
++		routeKey:            routeKey,
++		privateKey:          privateKey,
++		serverPublicKey:     serverPublicKey,
 +	}, nil
 +}
 +
@@ -268,16 +274,17 @@ index 0000000..ddf75b6
 +		return E.Cause(err, "create Noranite gVisor device")
 +	}
 +
-+	// Outer UDP acquisition is intentionally lazy. Starting sing-box while the
-+	// host is offline must not fail the endpoint; the transport manager publishes
-+	// the first socket when network policy becomes usable.
++	// Outer UDP acquisition is recoverable rather than demand-lazy. The transport
++	// manager attempts to acquire the first socket at startup, but an offline host
++	// does not fail the endpoint and repeated dial failures use capped backoff.
 +	client, err := noraniteCore.NewClient(noraniteCore.ClientConfig{
-+		TunnelIPv4:       e.tunnelIPv4,
-+		ServerEndpoint:   e.serverEndpoint,
-+		MTU:              e.mtu,
-+		RouteKey:         e.routeKey,
-+		StaticPrivateKey: e.privateKey,
-+		ServerPublicKey:  e.serverPublicKey,
++		TunnelIPv4:          e.tunnelIPv4,
++		ServerEndpoint:      e.serverEndpoint,
++		MTU:                 e.mtu,
++		RouteKey:            e.routeKey,
++		StaticPrivateKey:    e.privateKey,
++		ServerPublicKey:     e.serverPublicKey,
++		PersistentKeepalive: e.persistentKeepalive,
 +	}, device, nil)
 +	if err != nil {
 +		e.lifecycleMu.Unlock()
@@ -329,6 +336,7 @@ index 0000000..ddf75b6
 +	failures := client.TransportFailures()
 +
 +	needDial := true
++	redialDelay := transportRedialDelayMin
 +	var currentGeneration uint64
 +
 +	for {
@@ -342,11 +350,13 @@ index 0000000..ddf75b6
 +				}
 +				e.logger.Info("Noranite outer transport unavailable (generation ", failure.Generation, "): ", failure.Err)
 +				needDial = true
++				redialDelay = transportRedialDelayMin
 +			case <-wake:
 +				// pause/wake is analogous to WireGuard Down/Up. If the old tracked
 +				// socket was already closed by ResetNetwork, TransportFailure reaches
 +				// the same path; otherwise replace it after the host becomes active.
 +				needDial = true
++				redialDelay = transportRedialDelayMin
 +			}
 +			continue
 +		}
@@ -382,6 +392,7 @@ index 0000000..ddf75b6
 +			if replaceErr == nil {
 +				currentGeneration = generation
 +				needDial = false
++				redialDelay = transportRedialDelayMin
 +				continue
 +			}
 +			_ = transport.Close()
@@ -394,21 +405,24 @@ index 0000000..ddf75b6
 +		if ctx.Err() != nil {
 +			return
 +		}
-+		e.logger.Warn("dial Noranite outer transport: ", err, "; retry in ", transportRedialDelay)
++		e.logger.Warn("dial Noranite outer transport: ", err, "; retry in ", redialDelay)
 +
-+		timer := time.NewTimer(transportRedialDelay)
++		timer := time.NewTimer(redialDelay)
 +		select {
 +		case <-ctx.Done():
 +			stopTimer(timer)
 +			return
 +		case <-timer.C:
++			redialDelay = nextTransportRedialDelay(redialDelay)
 +		case failure := <-failures:
 +			stopTimer(timer)
 +			if failure.Generation == currentGeneration {
 +				e.logger.Info("Noranite outer transport unavailable during recovery (generation ", failure.Generation, "): ", failure.Err)
++				redialDelay = transportRedialDelayMin
 +			}
 +		case <-wake:
 +			stopTimer(timer)
++			redialDelay = transportRedialDelayMin
 +		}
 +	}
 +}
@@ -426,6 +440,16 @@ index 0000000..ddf75b6
 +		}
 +	}
 +	return ctx.Err() == nil
++}
++
++func nextTransportRedialDelay(current time.Duration) time.Duration {
++	if current < transportRedialDelayMin {
++		return transportRedialDelayMin
++	}
++	if current >= transportRedialDelayMax/2 {
++		return transportRedialDelayMax
++	}
++	return current * 2
 +}
 +
 +func stopTimer(timer *time.Timer) {
@@ -575,9 +599,6 @@ index 0000000..ddf75b6
 +	e.lifecycleMu.Unlock()
 +	if device == nil || client == nil {
 +		return nil, E.New("Noranite is not ready yet")
-+	}
-+	if err := client.WaitReady(ctx); err != nil {
-+		return nil, E.Cause(err, "wait for Noranite session readiness")
 +	}
 +	return device, nil
 +}

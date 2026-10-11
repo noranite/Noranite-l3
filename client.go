@@ -30,12 +30,11 @@ const (
 	defaultReceiveGrace       = 5 * time.Second
 	defaultSoftRekeyAfter     = 12 * time.Hour
 
-	defaultEstablishmentRetryMin = 2500 * time.Millisecond
-	defaultEstablishmentRetryMax = 3500 * time.Millisecond
+	defaultEstablishmentRetryMin       = 5 * time.Second
+	defaultEstablishmentRetryMax       = 6 * time.Second
+	defaultEstablishmentAttemptTimeout = 90 * time.Second
 
-	defaultKeepaliveIntervalMin = 25 * time.Second
-	defaultKeepaliveIntervalMax = 35 * time.Second
-	defaultKeepaliveTimeout     = 2 * time.Second
+	defaultKeepaliveTimeout = 5 * time.Second
 )
 
 var (
@@ -58,7 +57,8 @@ type PacketDevice interface {
 	Close() error
 }
 
-// ClientConfig contains protocol identity and fixed peer addressing only.
+// ClientConfig contains protocol identity, fixed peer addressing and optional
+// persistent NAT keepalive policy.
 // Runtime queue sizes, worker counts and batching are implementation details.
 type ClientConfig struct {
 	TunnelIPv4     netip.Addr
@@ -68,6 +68,13 @@ type ClientConfig struct {
 	RouteKey         [32]byte // Required; must not be all zero.
 	StaticPrivateKey [32]byte
 	ServerPublicKey  [32]byte
+
+	// PersistentKeepalive opts into background connectivity. While a usable
+	// Session exists, encrypted keepalives maintain it during outbound idle. If no
+	// usable Session exists, the same cadence permits a fresh bounded establishment
+	// cycle after an exhausted one. Zero disables this background policy; ordinary
+	// DATA and WaitReady can still drive establishment and liveness recovery.
+	PersistentKeepalive time.Duration
 }
 
 // TransportFailure reports loss of the currently published outer transport.
@@ -103,6 +110,9 @@ func NewClient(config ClientConfig, device PacketDevice, transport net.Conn) (*C
 	}
 	if config.RouteKey == ([32]byte{}) {
 		return nil, fmt.Errorf("route key must not be all zero: %w", dataplane.ErrInvalidConfig)
+	}
+	if config.PersistentKeepalive < 0 {
+		return nil, fmt.Errorf("persistent keepalive must not be negative: %w", dataplane.ErrInvalidConfig)
 	}
 	if config.MTU < MinTunnelMTU || config.MTU > MaxTunnelMTU {
 		return nil, fmt.Errorf(
@@ -149,18 +159,23 @@ func NewClient(config ClientConfig, device PacketDevice, transport net.Conn) (*C
 		return nil, err
 	}
 
+	controllerConfig := coreclient.SessionControllerConfig{
+		SoftRekeyAfter:              defaultSoftRekeyAfter,
+		EstablishmentRetryMin:       defaultEstablishmentRetryMin,
+		EstablishmentRetryMax:       defaultEstablishmentRetryMax,
+		EstablishmentAttemptTimeout: defaultEstablishmentAttemptTimeout,
+	}
+	if config.PersistentKeepalive > 0 {
+		controllerConfig.KeepaliveIntervalMin = config.PersistentKeepalive
+		controllerConfig.KeepaliveIntervalMax = config.PersistentKeepalive
+		controllerConfig.KeepaliveTimeout = defaultKeepaliveTimeout
+	}
+
 	controller, err := coreclient.NewSessionController(
 		core,
 		runtime,
 		factory,
-		coreclient.SessionControllerConfig{
-			SoftRekeyAfter:        defaultSoftRekeyAfter,
-			EstablishmentRetryMin: defaultEstablishmentRetryMin,
-			EstablishmentRetryMax: defaultEstablishmentRetryMax,
-			KeepaliveIntervalMin:  defaultKeepaliveIntervalMin,
-			KeepaliveIntervalMax:  defaultKeepaliveIntervalMax,
-			KeepaliveTimeout:      defaultKeepaliveTimeout,
-		},
+		controllerConfig,
 	)
 	if err != nil {
 		runtime.disposeConstructionFailure()
@@ -236,10 +251,11 @@ func (c *Client) Run(ctx context.Context) error {
 	return runtimeErr
 }
 
-// WaitReady waits until the first traffic Session has been established. The
-// signal is one-way: once initial readiness succeeds, later rekey/recovery gaps
-// do not make the Client unready again. Integrations should wait here before
-// exposing a newly created PacketDevice to application traffic.
+// WaitReady explicitly requests a usable traffic Session and waits until one is
+// available. It may drive successive bounded establishment cycles until ctx ends.
+// Normal embedded operation does not need to call it: the first DATA packet
+// activates establishment lazily and is held by the runtime until the Session is
+// ready.
 func (c *Client) WaitReady(ctx context.Context) error {
 	if c == nil || c.runtime == nil || c.controller == nil {
 		return fmt.Errorf("opaque client is nil: %w", dataplane.ErrInvalidConfig)
@@ -255,31 +271,40 @@ func (c *Client) WaitReady(ctx context.Context) error {
 		return ErrClientClosed
 	}
 
-	ready := c.controller.Ready()
-	select {
-	case <-ready:
-		return nil
-	default:
-	}
-
-	select {
-	case <-ready:
-		return nil
-	case <-c.runtime.Done():
+	for {
+		demand := c.controller.HandleOutboundDemand()
 		select {
-		case <-ready:
+		case <-demand.Usable:
 			return nil
 		default:
 		}
-		c.runMu.Lock()
-		closed = c.closed
-		c.runMu.Unlock()
-		if closed {
-			return ErrClientClosed
+
+		select {
+		case <-demand.Usable:
+			return nil
+		case <-demand.Abandoned:
+			// WaitReady is an explicit eager-connect API. A bounded establishment
+			// cycle may end under prolonged loss; as long as the caller's context is
+			// alive, a new cycle is still explicitly requested. Explicit rekey also
+			// bypasses the ordinary-DATA cool-off used to drain queued device backlog.
+			c.controller.RequestRekey()
+			continue
+		case <-c.runtime.Done():
+			select {
+			case <-demand.Usable:
+				return nil
+			default:
+			}
+			c.runMu.Lock()
+			closed = c.closed
+			c.runMu.Unlock()
+			if closed {
+				return ErrClientClosed
+			}
+			return ErrClientStopped
+		case <-ctx.Done():
+			return ctx.Err()
 		}
-		return ErrClientStopped
-	case <-ctx.Done():
-		return ctx.Err()
 	}
 }
 
@@ -297,8 +322,8 @@ func (c *Client) TransportFailures() <-chan TransportFailure {
 // transport without changing traffic Session state. On success it returns the
 // monotonically increasing transport generation ID, Client owns the new
 // transport, and the previous generation is closed. A running Client notifies
-// SessionController only after the new transport has been published, causing
-// immediate path liveness/re-establishment work on the replacement path.
+// SessionController only after the new transport has been published. Active
+// establishment retries immediately; an otherwise idle Session stays idle.
 //
 // On error the returned generation is zero and ownership remains with the caller.
 func (c *Client) ReplaceTransport(transport net.Conn) (uint64, error) {

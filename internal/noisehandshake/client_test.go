@@ -323,6 +323,7 @@ func TestNoiseClientIntegratesWithSessionController(t *testing.T) {
 	defer cancel()
 	runErr := make(chan error, 1)
 	go func() { runErr <- controller.Run(ctx) }()
+	controller.HandleOutboundDemand()
 
 	var init coreclient.EstablishmentDatagram
 	select {

@@ -194,6 +194,12 @@ func TestSessionControllerReadyClosesAfterFirstSessionInstall(t *testing.T) {
 	default:
 	}
 
+	usable := controller.HandleOutboundDemand().Usable
+	select {
+	case <-usable:
+		t.Fatal("outbound demand became usable before the first Session was installed")
+	default:
+	}
 	if err := controller.runDue(clock.Now()); err != nil {
 		t.Fatalf("runDue: %v", err)
 	}
@@ -204,6 +210,248 @@ func TestSessionControllerReadyClosesAfterFirstSessionInstall(t *testing.T) {
 	}
 	if core.Session() == nil || core.Session().ID() != material.SessionID {
 		t.Fatalf("current session=%v, want %#x", core.Session(), material.SessionID)
+	}
+	select {
+	case <-usable:
+	default:
+		t.Fatal("outbound demand did not become usable after Session install")
+	}
+}
+
+func TestSessionControllerColdStartDemandAbandonsAfterAttemptBudget(t *testing.T) {
+	t0 := time.Unix(1_799_999_995, 0)
+	clock := newControllerFakeClock(t0)
+	serverEndpoint := netip.MustParseAddrPort("127.0.0.1:48795")
+	core := controllerClientCore(t, clock, netip.MustParseAddr("10.87.9.5"), serverEndpoint, nil)
+	runtime := newControllerTestRuntime()
+	retries := 0
+	factory := &controllerTestFactory{startFn: func(_ int, _ time.Time) (EstablishmentAttempt, EstablishmentUpdate, error) {
+		return &controllerTestAttempt{retryFn: func(_ time.Time) (EstablishmentUpdate, error) {
+			retries++
+			return EstablishmentUpdate{}, nil
+		}}, EstablishmentUpdate{}, nil
+	}}
+	controller, err := newSessionController(core, runtime, factory, SessionControllerConfig{
+		SoftRekeyAfter:              20 * time.Second,
+		EstablishmentRetryMin:       time.Second,
+		EstablishmentRetryMax:       time.Second,
+		EstablishmentAttemptTimeout: 3 * time.Second,
+	}, clock)
+	if err != nil {
+		t.Fatalf("newSessionController: %v", err)
+	}
+
+	demand := controller.HandleOutboundDemand()
+	if err := controller.runDue(clock.Now()); err != nil {
+		t.Fatalf("start establishment: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		clock.Advance(time.Second)
+		if err := controller.runDue(clock.Now()); err != nil {
+			t.Fatalf("retry %d: %v", i+1, err)
+		}
+	}
+	clock.Advance(time.Second)
+	if err := controller.runDue(clock.Now()); err != nil {
+		t.Fatalf("attempt budget expiry: %v", err)
+	}
+
+	if retries != 2 {
+		t.Fatalf("retries=%d, want 2 before the 3s budget expired", retries)
+	}
+	select {
+	case <-demand.Abandoned:
+	default:
+		t.Fatal("cold-start demand was not abandoned after establishment budget")
+	}
+	select {
+	case <-demand.Usable:
+		t.Fatal("cold-start demand became usable without a Session")
+	default:
+	}
+
+	controller.mu.Lock()
+	if controller.attempt != nil || !controller.nextAction.IsZero() {
+		t.Fatalf("establishment remained active after budget: attempt=%v next=%v", controller.attempt, controller.nextAction)
+	}
+	controller.mu.Unlock()
+
+	// DATA already queued behind the packet that owned the exhausted cycle must
+	// not immediately buy another full establishment budget.
+	nextDemand := controller.HandleOutboundDemand()
+	select {
+	case <-nextDemand.Abandoned:
+	default:
+		t.Fatal("post-abandon DATA was not suppressed during retry cool-off")
+	}
+	if factory.starts != 1 {
+		t.Fatalf("factory starts=%d during cool-off, want 1", factory.starts)
+	}
+
+	// Once the short cool-off expires, the next DATA is fresh demand and starts
+	// another independently bounded cycle.
+	clock.Advance(time.Second)
+	nextDemand = controller.HandleOutboundDemand()
+	select {
+	case <-nextDemand.Abandoned:
+		t.Fatal("fresh demand inherited the previous abandonment signal after cool-off")
+	default:
+	}
+	if err := controller.runDue(clock.Now()); err != nil {
+		t.Fatalf("restart establishment for fresh demand: %v", err)
+	}
+	if factory.starts != 2 {
+		t.Fatalf("factory starts=%d, want a fresh second cycle", factory.starts)
+	}
+}
+
+func TestSessionControllerPersistentKeepaliveRetriesAfterColdStartBudget(t *testing.T) {
+	t0 := time.Unix(1_799_999_995, 0)
+	clock := newControllerFakeClock(t0)
+	serverEndpoint := netip.MustParseAddrPort("127.0.0.1:48793")
+	core := controllerClientCore(t, clock, netip.MustParseAddr("10.87.9.3"), serverEndpoint, nil)
+	runtime := newControllerTestRuntime()
+	factory := &controllerTestFactory{startFn: func(_ int, _ time.Time) (EstablishmentAttempt, EstablishmentUpdate, error) {
+		return &controllerTestAttempt{}, EstablishmentUpdate{}, nil
+	}}
+	controller, err := newSessionController(core, runtime, factory, SessionControllerConfig{
+		SoftRekeyAfter:              20 * time.Second,
+		EstablishmentRetryMin:       time.Second,
+		EstablishmentRetryMax:       time.Second,
+		EstablishmentAttemptTimeout: 3 * time.Second,
+		KeepaliveIntervalMin:        5 * time.Second,
+		KeepaliveIntervalMax:        5 * time.Second,
+		KeepaliveTimeout:            time.Second,
+	}, clock)
+	if err != nil {
+		t.Fatalf("newSessionController: %v", err)
+	}
+
+	if err := controller.runDue(clock.Now()); err != nil {
+		t.Fatalf("start persistent cold establishment: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		clock.Advance(time.Second)
+		if err := controller.runDue(clock.Now()); err != nil {
+			t.Fatalf("persistent establishment step %d: %v", i+1, err)
+		}
+	}
+	if factory.starts != 1 {
+		t.Fatalf("factory starts=%d after first bounded cycle, want 1", factory.starts)
+	}
+
+	controller.mu.Lock()
+	next := controller.nextAction
+	controller.mu.Unlock()
+	wantNext := clock.Now().Add(5 * time.Second)
+	if !next.Equal(wantNext) {
+		t.Fatalf("next persistent establishment=%v, want %v", next, wantNext)
+	}
+
+	clock.Advance(4 * time.Second)
+	if err := controller.runDue(clock.Now()); err != nil {
+		t.Fatalf("runDue before persistent retry: %v", err)
+	}
+	if factory.starts != 1 {
+		t.Fatalf("factory starts=%d before persistent cadence, want 1", factory.starts)
+	}
+
+	clock.Advance(time.Second)
+	if err := controller.runDue(clock.Now()); err != nil {
+		t.Fatalf("restart persistent establishment: %v", err)
+	}
+	if factory.starts != 2 {
+		t.Fatalf("factory starts=%d, want second bounded cycle from persistent keepalive", factory.starts)
+	}
+}
+
+func TestSessionControllerExplicitRekeyBypassesDemandCooloff(t *testing.T) {
+	t0 := time.Unix(1_799_999_995, 0)
+	clock := newControllerFakeClock(t0)
+	serverEndpoint := netip.MustParseAddrPort("127.0.0.1:48794")
+	core := controllerClientCore(t, clock, netip.MustParseAddr("10.87.9.4"), serverEndpoint, nil)
+	runtime := newControllerTestRuntime()
+	factory := &controllerTestFactory{startFn: func(_ int, _ time.Time) (EstablishmentAttempt, EstablishmentUpdate, error) {
+		return &controllerTestAttempt{}, EstablishmentUpdate{}, nil
+	}}
+	controller, err := newSessionController(core, runtime, factory, SessionControllerConfig{
+		SoftRekeyAfter:              20 * time.Second,
+		EstablishmentRetryMin:       5 * time.Second,
+		EstablishmentRetryMax:       5 * time.Second,
+		EstablishmentAttemptTimeout: time.Second,
+	}, clock)
+	if err != nil {
+		t.Fatalf("newSessionController: %v", err)
+	}
+
+	controller.HandleOutboundDemand()
+	if err := controller.runDue(clock.Now()); err != nil {
+		t.Fatalf("start establishment: %v", err)
+	}
+	clock.Advance(time.Second)
+	if err := controller.runDue(clock.Now()); err != nil {
+		t.Fatalf("expire establishment: %v", err)
+	}
+
+	controller.RequestRekey()
+	demand := controller.HandleOutboundDemand()
+	select {
+	case <-demand.Abandoned:
+		t.Fatal("explicit rekey did not bypass demand cool-off")
+	default:
+	}
+	if err := controller.runDue(clock.Now()); err != nil {
+		t.Fatalf("restart establishment after explicit rekey: %v", err)
+	}
+	if factory.starts != 2 {
+		t.Fatalf("factory starts=%d, want 2", factory.starts)
+	}
+}
+
+func TestSessionControllerExpiredRekeyAttemptKeepsUsableCurrent(t *testing.T) {
+	t0 := time.Unix(1_799_999_996, 0)
+	clock := newControllerFakeClock(t0)
+	clientA, _, _ := controllerSessionPair(t, 0xc0e6, 0x06)
+	serverEndpoint := netip.MustParseAddrPort("127.0.0.1:48796")
+	core := controllerClientCore(t, clock, netip.MustParseAddr("10.87.9.6"), serverEndpoint, clientA)
+	runtime := newControllerTestRuntime()
+	factory := &controllerTestFactory{startFn: func(_ int, _ time.Time) (EstablishmentAttempt, EstablishmentUpdate, error) {
+		return &controllerTestAttempt{}, EstablishmentUpdate{}, nil
+	}}
+	controller, err := newSessionController(core, runtime, factory, SessionControllerConfig{
+		SoftRekeyAfter:              20 * time.Second,
+		EstablishmentRetryMin:       time.Second,
+		EstablishmentRetryMax:       time.Second,
+		EstablishmentAttemptTimeout: 3 * time.Second,
+	}, clock)
+	if err != nil {
+		t.Fatalf("newSessionController: %v", err)
+	}
+
+	controller.RequestRekey()
+	if err := controller.runDue(clock.Now()); err != nil {
+		t.Fatalf("start rekey: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		clock.Advance(time.Second)
+		if err := controller.runDue(clock.Now()); err != nil {
+			t.Fatalf("rekey step %d: %v", i+1, err)
+		}
+	}
+
+	if core.Session() != clientA {
+		t.Fatal("expired make-before-break rekey discarded the usable current Session")
+	}
+	demand := controller.HandleOutboundDemand()
+	select {
+	case <-demand.Usable:
+	default:
+		t.Fatal("current Session stopped being usable after rekey attempt budget")
+	}
+	select {
+	case <-demand.Abandoned:
+		t.Fatal("usable current was reported as abandoned after failed rekey")
+	default:
 	}
 }
 
@@ -559,7 +807,7 @@ func TestSessionControllerRandomizedPolicyStaysInsideConfiguredRanges(t *testing
 	}
 }
 
-func TestSessionControllerTransportReboundImmediatelyKeepsCurrentAlive(t *testing.T) {
+func TestSessionControllerTransportReboundImmediatelyKeepsPersistentCurrentAlive(t *testing.T) {
 	t0 := time.Unix(1_800_000_087, 0)
 	clock := newControllerFakeClock(t0)
 	clientA, _, _ := controllerSessionPair(t, 0xc187, 0x3b)
@@ -594,8 +842,10 @@ func TestSessionControllerTransportReboundImmediatelyKeepsCurrentAlive(t *testin
 
 	controller.TransportRebound()
 	controller.mu.Lock()
-	if controller.keepaliveID != 0 || !controller.keepaliveDeadline.IsZero() || controller.keepaliveTimeouts != 0 {
-		t.Fatalf("old-path keepalive state survived rebound: id=%d deadline=%v timeouts=%d", controller.keepaliveID, controller.keepaliveDeadline, controller.keepaliveTimeouts)
+	if controller.outstandingProbeID != 0 || !controller.probeStartedAt.IsZero() ||
+		!controller.keepaliveDeadline.IsZero() || controller.keepaliveTimeouts != 0 {
+		t.Fatalf("old-path keepalive state survived rebound: id=%d startedAt=%v deadline=%v timeouts=%d",
+			controller.outstandingProbeID, controller.probeStartedAt, controller.keepaliveDeadline, controller.keepaliveTimeouts)
 	}
 	if !controller.nextKeepalive.Equal(clock.Now()) {
 		t.Fatalf("next keepalive=%v, want immediate %v", controller.nextKeepalive, clock.Now())
@@ -616,6 +866,37 @@ func TestSessionControllerTransportReboundImmediatelyKeepsCurrentAlive(t *testin
 	}
 }
 
+func TestSessionControllerTransportReboundStaysSilentWithoutPersistentKeepalive(t *testing.T) {
+	t0 := time.Unix(1_800_000_087, 0)
+	clock := newControllerFakeClock(t0)
+	clientA, _, _ := controllerSessionPair(t, 0xc186, 0x3a)
+	serverEndpoint := netip.MustParseAddrPort("127.0.0.1:49086")
+	core := controllerClientCore(t, clock, netip.MustParseAddr("10.90.8.6"), serverEndpoint, clientA)
+	runtime := newControllerTestRuntime()
+	factory := &controllerTestFactory{startFn: func(_ int, _ time.Time) (EstablishmentAttempt, EstablishmentUpdate, error) {
+		return &controllerTestAttempt{}, EstablishmentUpdate{}, nil
+	}}
+	controller, err := newSessionController(core, runtime, factory, SessionControllerConfig{
+		SoftRekeyAfter:        20 * time.Second,
+		EstablishmentRetryMin: time.Second,
+		EstablishmentRetryMax: time.Second,
+	}, clock)
+	if err != nil {
+		t.Fatalf("newSessionController: %v", err)
+	}
+
+	controller.TransportRebound()
+	controller.mu.Lock()
+	next := controller.nextDueLocked()
+	controller.mu.Unlock()
+	if !next.IsZero() {
+		t.Fatalf("idle rebound armed protocol work at %v", next)
+	}
+	if len(runtime.transport) != 0 || factory.starts != 0 {
+		t.Fatalf("idle rebound emitted work: transport=%d starts=%d", len(runtime.transport), factory.starts)
+	}
+}
+
 func TestSessionControllerTransportReboundRetriesActiveEstablishmentImmediately(t *testing.T) {
 	t0 := time.Unix(1_800_000_088, 0)
 	clock := newControllerFakeClock(t0)
@@ -632,9 +913,10 @@ func TestSessionControllerTransportReboundRetriesActiveEstablishmentImmediately(
 		return attempt, EstablishmentUpdate{}, nil
 	}}
 	controller, err := newSessionController(core, runtime, factory, SessionControllerConfig{
-		SoftRekeyAfter:        20 * time.Second,
-		EstablishmentRetryMin: 10 * time.Second,
-		EstablishmentRetryMax: 10 * time.Second,
+		SoftRekeyAfter:              20 * time.Second,
+		EstablishmentRetryMin:       10 * time.Second,
+		EstablishmentRetryMax:       10 * time.Second,
+		EstablishmentAttemptTimeout: 5 * time.Second,
 	}, clock)
 	if err != nil {
 		t.Fatalf("newSessionController: %v", err)
@@ -648,6 +930,10 @@ func TestSessionControllerTransportReboundRetriesActiveEstablishmentImmediately(
 		t.Fatalf("retries=%d immediately after start, want 0", retries)
 	}
 
+	// Even if the old-path budget has elapsed, a successful transport replacement
+	// is a fresh network condition and must get one immediate retry plus a fresh
+	// bounded budget.
+	clock.Advance(6 * time.Second)
 	controller.TransportRebound()
 	if err := controller.runDue(clock.Now()); err != nil {
 		t.Fatalf("rebound retry: %v", err)
@@ -774,8 +1060,10 @@ func TestSessionControllerBToCDoesNotGrowClientGenerationSet(t *testing.T) {
 	}
 
 	// No reverse B is delivered. Soft rekey still installs C with the fixed
-	// current/previous transition; there is no third client slot.
+	// current/previous transition once application traffic demands the tunnel;
+	// there is no third client slot.
 	clock.Advance(10 * time.Second)
+	controller.HandleOutboundDemand()
 	if err := controller.runDue(clock.Now()); err != nil {
 		t.Fatalf("install C: %v", err)
 	}
@@ -846,6 +1134,7 @@ func TestSessionControllerSupersededNeverActiveBThenC(t *testing.T) {
 	}
 
 	clock.Advance(10 * time.Second)
+	controller.HandleOutboundDemand()
 	if err := controller.runDue(clock.Now()); err != nil {
 		t.Fatalf("install C: %v", err)
 	}
@@ -889,7 +1178,7 @@ func TestSessionControllerSupersededNeverActiveBThenC(t *testing.T) {
 	}
 }
 
-func TestSessionControllerSchedulesSoftRekeyFromActualInstallTime(t *testing.T) {
+func TestSessionControllerDemandDrivenSoftRekeyUsesActualInstallTime(t *testing.T) {
 	t0 := time.Unix(1_800_000_275, 0)
 	clock := newControllerFakeClock(t0)
 	clientA, _, _ := controllerSessionPair(t, 0xc380, 0x28)
@@ -951,13 +1240,30 @@ func TestSessionControllerSchedulesSoftRekeyFromActualInstallTime(t *testing.T) 
 	controller.mu.Lock()
 	next := controller.nextAction
 	controller.mu.Unlock()
-	wantNext := wantInstalledAt.Add(10 * time.Second)
-	if !next.Equal(wantNext) {
-		t.Fatalf("nextAction=%v, want actual install + soft rekey = %v", next, wantNext)
+	if !next.IsZero() {
+		t.Fatalf("idle Session armed soft-rekey work at %v", next)
+	}
+
+	clock.Advance(9 * time.Second)
+	controller.HandleOutboundDemand()
+	controller.mu.Lock()
+	next = controller.nextAction
+	controller.mu.Unlock()
+	if !next.IsZero() {
+		t.Fatalf("DATA before soft deadline armed rekey at %v", next)
+	}
+
+	clock.Advance(time.Second)
+	controller.HandleOutboundDemand()
+	controller.mu.Lock()
+	next = controller.nextAction
+	controller.mu.Unlock()
+	if !next.Equal(clock.Now()) {
+		t.Fatalf("DATA at soft deadline armed rekey at %v, want %v", next, clock.Now())
 	}
 }
 
-func TestSessionControllerMissedKeepaliveACKStartsFreshEstablishment(t *testing.T) {
+func TestSessionControllerMissedPeerProofStartsFreshEstablishment(t *testing.T) {
 	t0 := time.Unix(1_800_000_290, 0)
 	clock := newControllerFakeClock(t0)
 	clientA, _, _ := controllerSessionPair(t, 0xc390, 0x29)
@@ -1003,8 +1309,8 @@ func TestSessionControllerMissedKeepaliveACKStartsFreshEstablishment(t *testing.
 	}
 
 	// Model server process restart: the old generation is gone, therefore no
-	// authenticated ACK can arrive. Individual UDP loss is tolerated; only three
-	// consecutive keepalive timeouts escalate to establishment.
+	// authenticated current-generation RX can arrive. Individual UDP loss is
+	// tolerated; only two consecutive probe timeouts escalate to establishment.
 	for miss := 1; miss < keepaliveTimeoutsBeforeRekey; miss++ {
 		clock.Advance(2 * time.Second)
 		if err := controller.runDue(clock.Now()); err != nil {
@@ -1032,7 +1338,7 @@ func TestSessionControllerMissedKeepaliveACKStartsFreshEstablishment(t *testing.
 	}
 }
 
-func TestSessionControllerMatchingKeepaliveACKPreventsRecovery(t *testing.T) {
+func TestSessionControllerAuthenticatedCurrentRXPreventsRecovery(t *testing.T) {
 	t0 := time.Unix(1_800_000_295, 0)
 	clock := newControllerFakeClock(t0)
 	clientA, _, _ := controllerSessionPair(t, 0xc395, 0x2a)
@@ -1067,39 +1373,47 @@ func TestSessionControllerMatchingKeepaliveACKPreventsRecovery(t *testing.T) {
 	if len(runtime.transport) != 1 {
 		t.Fatalf("keepalive submissions=%d, want 1", len(runtime.transport))
 	}
-	keepaliveID := runtime.transport[0].keepaliveID
-	if keepaliveID == 0 {
-		t.Fatal("keepalive id is zero")
-	}
 
-	controller.HandleAuthenticatedACK(keepaliveID)
-	clock.Advance(2 * time.Second)
+	clock.Advance(time.Second)
+	core.peer.mu.Lock()
+	core.peer.lastCurrentAuthenticatedRX = clock.Now()
+	core.peer.mu.Unlock()
+	clock.Advance(time.Second)
 	if err := controller.runDue(clock.Now()); err != nil {
-		t.Fatalf("post-ACK runDue: %v", err)
+		t.Fatalf("post-authenticated-RX runDue: %v", err)
 	}
 	if factory.starts != 0 {
-		t.Fatalf("establishment starts=%d after matching ACK, want 0", factory.starts)
+		t.Fatalf("establishment starts=%d after authenticated current RX, want 0", factory.starts)
+	}
+	if len(runtime.transport) != 1 {
+		t.Fatalf("authenticated current RX did not suppress retry: submissions=%d", len(runtime.transport))
 	}
 
 	controller.mu.Lock()
-	nextKeepalive := controller.nextKeepalive
 	deadline := controller.keepaliveDeadline
+	nextKeepalive := controller.nextKeepalive
 	controller.mu.Unlock()
-	wantNext := t0.Add(10 * time.Second)
-	if !nextKeepalive.Equal(wantNext) {
-		t.Fatalf("next keepalive=%v, want %v", nextKeepalive, wantNext)
-	}
 	if !deadline.IsZero() {
-		t.Fatalf("keepalive deadline remained armed after ACK: %v", deadline)
+		t.Fatalf("keepalive deadline remained armed after authenticated current RX: %v", deadline)
+	}
+	wantNextKeepalive := t0.Add(10 * time.Second)
+	if !nextKeepalive.Equal(wantNextKeepalive) {
+		t.Fatalf("next keepalive=%v, want cadence from last probe %v", nextKeepalive, wantNextKeepalive)
 	}
 }
 
-func TestSessionControllerWrongKeepaliveACKDoesNotMaskFailure(t *testing.T) {
+func TestSessionControllerPersistentKeepaliveMovesAfterApplicationData(t *testing.T) {
 	t0 := time.Unix(1_800_000_297, 0)
 	clock := newControllerFakeClock(t0)
 	clientA, _, _ := controllerSessionPair(t, 0xc397, 0x2b)
 	serverEndpoint := netip.MustParseAddrPort("127.0.0.1:49297")
-	core := controllerClientCore(t, clock, netip.MustParseAddr("10.92.5.2"), serverEndpoint, clientA)
+	core := controllerClientCore(
+		t,
+		clock,
+		netip.MustParseAddr("10.92.5.2"),
+		serverEndpoint,
+		clientA,
+	)
 	runtime := newControllerTestRuntime()
 	factory := &controllerTestFactory{startFn: func(_ int, _ time.Time) (EstablishmentAttempt, EstablishmentUpdate, error) {
 		return &controllerTestAttempt{}, EstablishmentUpdate{}, nil
@@ -1116,24 +1430,116 @@ func TestSessionControllerWrongKeepaliveACKDoesNotMaskFailure(t *testing.T) {
 		t.Fatalf("newSessionController: %v", err)
 	}
 
-	clock.Advance(5 * time.Second)
+	clock.Advance(3 * time.Second)
+	controller.HandleOutboundActivity()
+	controller.mu.Lock()
+	nextKeepalive := controller.nextKeepalive
+	controller.mu.Unlock()
+	want := t0.Add(8 * time.Second)
+	if !nextKeepalive.Equal(want) {
+		t.Fatalf("next keepalive=%v after DATA, want %v", nextKeepalive, want)
+	}
+
+	clock.Advance(2 * time.Second)
 	if err := controller.runDue(clock.Now()); err != nil {
-		t.Fatalf("emit keepalive: %v", err)
+		t.Fatalf("runDue at old keepalive deadline: %v", err)
 	}
-	keepaliveID := runtime.transport[0].keepaliveID
-	controller.HandleAuthenticatedACK(keepaliveID + 1)
-	for miss := 1; miss <= keepaliveTimeoutsBeforeRekey; miss++ {
-		clock.Advance(2 * time.Second)
-		if err := controller.runDue(clock.Now()); err != nil {
-			t.Fatalf("keepalive timeout %d after wrong ACK: %v", miss, err)
-		}
-	}
-	if factory.starts != 1 {
-		t.Fatalf("establishment starts=%d after wrong ACK and consecutive timeouts, want 1", factory.starts)
+	if len(runtime.transport) != 0 {
+		t.Fatalf("old keepalive deadline emitted %d packets after DATA", len(runtime.transport))
 	}
 }
 
-func TestSessionControllerRunUsesSoftDeadlineAndStopsWithRuntime(t *testing.T) {
+func TestSessionControllerPersistentKeepaliveMovesAfterAuthenticatedRX(t *testing.T) {
+	t0 := time.Unix(1_800_000_298, 0)
+	clock := newControllerFakeClock(t0)
+	clientA, serverA, _ := controllerSessionPair(t, 0xc398, 0x2c)
+	serverEndpoint := netip.MustParseAddrPort("127.0.0.1:49298")
+	core := controllerClientCore(
+		t,
+		clock,
+		netip.MustParseAddr("10.92.5.3"),
+		serverEndpoint,
+		clientA,
+	)
+	runtime := newControllerTestRuntime()
+	factory := &controllerTestFactory{startFn: func(_ int, _ time.Time) (EstablishmentAttempt, EstablishmentUpdate, error) {
+		return &controllerTestAttempt{}, EstablishmentUpdate{}, nil
+	}}
+	controller, err := newSessionController(core, runtime, factory, SessionControllerConfig{
+		SoftRekeyAfter:        20 * time.Second,
+		EstablishmentRetryMin: time.Second,
+		EstablishmentRetryMax: time.Second,
+		KeepaliveIntervalMin:  5 * time.Second,
+		KeepaliveIntervalMax:  5 * time.Second,
+		KeepaliveTimeout:      2 * time.Second,
+	}, clock)
+	if err != nil {
+		t.Fatalf("newSessionController: %v", err)
+	}
+
+	clock.Advance(4 * time.Second)
+	var routeKey [32]byte
+	for i := range routeKey {
+		routeKey[i] = byte(0xa0 + i)
+	}
+	txScratch, err := dataplane.NewDataScratch(routeKey)
+	if err != nil {
+		t.Fatalf("NewDataScratch(TX): %v", err)
+	}
+	inner := testIPv4Packet(
+		t,
+		netip.MustParseAddr("10.92.5.1"),
+		core.TunnelIPv4(),
+		[]byte("authenticated peer activity"),
+	)
+	wire, _, err := serverA.SealDataTo(
+		txScratch,
+		make([]byte, 0, len(inner)+dataplane.MaxDataExpansion),
+		inner,
+	)
+	if err != nil {
+		t.Fatalf("SealDataTo: %v", err)
+	}
+	rxScratch, err := core.NewDataScratch()
+	if err != nil {
+		t.Fatalf("NewDataScratch(RX): %v", err)
+	}
+	op, err := core.AdmitNetworkDatagramAt(rxScratch, serverEndpoint, wire, clock.Now())
+	if err != nil {
+		t.Fatalf("AdmitNetworkDatagramAt: %v", err)
+	}
+	if err := op.Decrypt(rxScratch); err != nil {
+		t.Fatalf("Decrypt: %v", err)
+	}
+	if _, err := core.CommitInbound(op); err != nil {
+		t.Fatalf("CommitInbound: %v", err)
+	}
+
+	clock.Advance(time.Second)
+	if err := controller.runDue(clock.Now()); err != nil {
+		t.Fatalf("runDue at original keepalive deadline: %v", err)
+	}
+	if len(runtime.transport) != 0 {
+		t.Fatalf("authenticated RX did not defer idle keepalive: submissions=%d", len(runtime.transport))
+	}
+	controller.mu.Lock()
+	next := controller.nextKeepalive
+	controller.mu.Unlock()
+	want := t0.Add(9 * time.Second)
+	if !next.Equal(want) {
+		t.Fatalf("next keepalive=%v after RX, want %v", next, want)
+	}
+
+	clock.Advance(4 * time.Second)
+	if err := controller.runDue(clock.Now()); err != nil {
+		t.Fatalf("runDue at deferred keepalive deadline: %v", err)
+	}
+	if len(runtime.transport) != 1 {
+		t.Fatalf("deferred keepalive submissions=%d, want 1", len(runtime.transport))
+	}
+}
+
+func TestSessionControllerRunWaitsForDemandAfterSoftDeadlineAndStopsWithRuntime(t *testing.T) {
 	t0 := time.Unix(1_800_000_300, 0)
 	clock := newControllerFakeClock(t0)
 	clientA, _, _ := controllerSessionPair(t, 0xc400, 0x70)
@@ -1166,19 +1572,21 @@ func TestSessionControllerRunUsesSoftDeadlineAndStopsWithRuntime(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- controller.Run(ctx) }()
 
-	select {
-	case <-clock.created:
-	case <-time.After(3 * time.Second):
-		t.Fatal("controller did not arm soft-rekey timer")
-	}
 	clock.Advance(5 * time.Second)
+	select {
+	case n := <-started:
+		t.Fatalf("soft deadline started establishment without DATA, start=%d", n)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	controller.HandleOutboundDemand()
 	select {
 	case n := <-started:
 		if n != 1 {
 			t.Fatalf("first start number=%d", n)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("soft deadline did not start establishment")
+		t.Fatal("DATA after soft deadline did not start establishment")
 	}
 
 	close(runtime.done)

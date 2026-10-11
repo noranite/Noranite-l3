@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
@@ -12,28 +13,45 @@ import (
 	"github.com/noranite/Noranite-l3/internal/establishment"
 )
 
-const keepaliveTimeoutsBeforeRekey = 3
+const (
+	keepaliveTimeoutsBeforeRekey       = 2
+	activityProbeIdle                  = 30 * time.Second
+	defaultActivityProbeTimeout        = 5 * time.Second
+	defaultEstablishmentAttemptTimeout = 90 * time.Second
+	maxPostAbandonDemandCooldown       = 5 * time.Second
+)
 
 // SessionControllerConfig is orchestration policy above the fixed
 // current/previous crypto lifecycle.
 //
 // SoftRekeyAfter is measured from the installation time of the current traffic
-// generation. Establishment retry and periodic keepalive schedules choose a fresh
-// uniform delay inside their inclusive [Min, Max] ranges after each successful
-// scheduling point. Provider-local/internal failures are terminal and are surfaced
-// to the runtime; only network loss/rejection is represented by an update with no
+// generation. Without persistent keepalive, crossing it only marks the Session
+// for rekey: the next application DATA starts make-before-break establishment.
+// Establishment retry and periodic keepalive schedules choose a fresh uniform
+// delay inside their inclusive [Min, Max] ranges after each successful scheduling
+// point. Provider-local/internal failures are terminal and are surfaced to the
+// runtime; only network loss/rejection is represented by an update with no
 // completion.
 type SessionControllerConfig struct {
 	SoftRekeyAfter time.Duration
 
 	EstablishmentRetryMin time.Duration
 	EstablishmentRetryMax time.Duration
+	// EstablishmentAttemptTimeout bounds one continuous establishment cycle.
+	// Zero uses defaultEstablishmentAttemptTimeout. After the budget is exhausted,
+	// ordinary DATA is briefly suppressed so queued device backlog cannot
+	// immediately start another full cycle. Explicit rekey and transport rebound
+	// bypass that suppression.
+	EstablishmentAttemptTimeout time.Duration
 
-	// KeepaliveIntervalMin/Max and KeepaliveTimeout are an optional liveness
-	// policy for the installed traffic generation. All zero disables it. When
-	// enabled, three consecutive missed authenticated ACKs start normal fresh
-	// establishment. ACK never confirms, rolls back or otherwise changes
-	// generation lifecycle state.
+	// KeepaliveIntervalMin/Max are an optional persistent keepalive policy for
+	// keeping an idle NAT mapping open. When no usable Session exists, enabling
+	// this policy also permits background bounded establishment cycles at the same
+	// cadence. All zero disables persistent keepalive.
+	//
+	// KeepaliveTimeout is required when persistent keepalive is enabled. Activity-
+	// driven liveness probes remain enabled even when periodic keepalive is off;
+	// in that case their timeout defaults to defaultActivityProbeTimeout.
 	KeepaliveIntervalMin time.Duration
 	KeepaliveIntervalMax time.Duration
 	KeepaliveTimeout     time.Duration
@@ -49,6 +67,12 @@ func (c SessionControllerConfig) validate(generationLifetime time.Duration) erro
 			"invalid establishment retry range [%s, %s]: %w",
 			c.EstablishmentRetryMin,
 			c.EstablishmentRetryMax,
+			dataplane.ErrInvalidConfig,
+		)
+	}
+	if c.EstablishmentAttemptTimeout < 0 {
+		return fmt.Errorf(
+			"establishment attempt timeout must not be negative: %w",
 			dataplane.ErrInvalidConfig,
 		)
 	}
@@ -176,14 +200,25 @@ type SessionController struct {
 
 	mu sync.Mutex
 
-	attempt    EstablishmentAttempt
-	nextAction time.Time
+	attempt               EstablishmentAttempt
+	attemptStartedAt      time.Time
+	nextAction            time.Time
+	demandRetryAfter      time.Time
+	usable                chan struct{}
+	usableOpen            bool
+	demandAbandoned       chan struct{}
+	demandAbandonedClosed bool
 
-	nextKeepalive     time.Time
-	keepaliveID       uint64
-	keepaliveDeadline time.Time
-	keepaliveTimeouts int
-	nextKeepaliveID   uint64
+	nextKeepalive          time.Time
+	keepaliveProofBaseline time.Time
+	outstandingProbeID     uint64
+	probeStartedAt         time.Time
+	lastProbeQueuedAt      time.Time
+	keepaliveDeadline      time.Time
+	keepaliveTimeouts      int
+	nextKeepaliveID        uint64
+	lastPeerProof          time.Time
+	pathNeedsProof         bool
 
 	ready       chan struct{}
 	readyClosed bool
@@ -214,31 +249,48 @@ func newSessionController(
 	}
 
 	now := clock.Now()
-	next := now
+	var next time.Time
 	var nextKeepalive time.Time
+	var lastPeerProof time.Time
 	hasCurrent := false
 	if installedAt, ok := core.peer.currentInstalledAt(); ok {
 		hasCurrent = true
-		next = installedAt.Add(config.SoftRekeyAfter)
-		if next.Before(now) {
-			next = now
-		}
+		lastPeerProof = installedAt
 		if config.KeepaliveIntervalMin > 0 {
+			next = installedAt.Add(config.SoftRekeyAfter)
+			if next.Before(now) {
+				next = now
+			}
 			nextKeepalive = now.Add(randomDuration(config.KeepaliveIntervalMin, config.KeepaliveIntervalMax))
 		}
+	} else if config.KeepaliveIntervalMin > 0 {
+		// Persistent keepalive is an explicit request for background connectivity,
+		// so it also activates the first Session without waiting for application DATA.
+		next = now
+	}
+	usable := make(chan struct{})
+	usableOpen := true
+	if core.peer.currentTXEligible(now) {
+		close(usable)
+		usableOpen = false
 	}
 
 	controller := &SessionController{
-		core:            core,
-		runtime:         runtime,
-		factory:         factory,
-		config:          config,
-		clock:           clock,
-		nextAction:      next,
-		nextKeepalive:   nextKeepalive,
-		nextKeepaliveID: 1,
-		ready:           make(chan struct{}),
-		wake:            make(chan struct{}, 1),
+		core:                   core,
+		runtime:                runtime,
+		factory:                factory,
+		config:                 config,
+		clock:                  clock,
+		nextAction:             next,
+		usable:                 usable,
+		usableOpen:             usableOpen,
+		demandAbandoned:        make(chan struct{}),
+		nextKeepalive:          nextKeepalive,
+		keepaliveProofBaseline: lastPeerProof,
+		nextKeepaliveID:        1,
+		lastPeerProof:          lastPeerProof,
+		ready:                  make(chan struct{}),
+		wake:                   make(chan struct{}, 1),
 	}
 	if hasCurrent {
 		close(controller.ready)
@@ -257,6 +309,17 @@ func (c *SessionController) Ready() <-chan struct{} {
 	return c.ready
 }
 
+// OutboundDemandWait describes the outcome of one outbound demand cycle.
+// Usable closes when a current Session can carry DATA. Abandoned closes when a
+// bounded establishment cycle ends without producing one. Callers holding a
+// packet should drop that packet on Abandoned. Immediately queued DATA may also
+// be abandoned during the short post-cycle cool-off; later demand can start a
+// fresh cycle.
+type OutboundDemandWait struct {
+	Usable    <-chan struct{}
+	Abandoned <-chan struct{}
+}
+
 // RequestRekey coalesces with an already-active establishment attempt. If no
 // attempt is active, it moves the next establishment start to now.
 func (c *SessionController) RequestRekey() {
@@ -266,7 +329,8 @@ func (c *SessionController) RequestRekey() {
 
 	now := c.clock.Now()
 	c.mu.Lock()
-	if c.attempt == nil && c.nextAction.After(now) {
+	c.demandRetryAfter = time.Time{}
+	if c.attempt == nil && (c.nextAction.IsZero() || c.nextAction.After(now)) {
 		c.nextAction = now
 	}
 	c.mu.Unlock()
@@ -274,11 +338,10 @@ func (c *SessionController) RequestRekey() {
 }
 
 // TransportRebound reports that the runtime has successfully replaced or
-// rebound the outer transport after a network change. Protocol state survives:
-// an active establishment attempt retries immediately with a fresh exchange;
-// otherwise a still-usable current generation sends an immediate KEEPALIVE so
-// the server can learn the new authenticated endpoint. If current is absent or
-// hard-expired, normal fresh establishment starts immediately.
+// rebound the outer transport after a network change. Protocol state survives.
+// Active establishment retries immediately on the new path. An idle usable
+// Session stays silent; ordinary DATA will teach the server the new endpoint.
+// Persistent keepalive remains background-active when explicitly configured.
 //
 // Any outstanding KEEPALIVE belongs to the old path and is forgotten without
 // counting it as a liveness failure. Call this only after the replacement
@@ -289,49 +352,143 @@ func (c *SessionController) TransportRebound() {
 	}
 
 	now := c.clock.Now()
+	wake := false
 	c.mu.Lock()
-	c.keepaliveID = 0
+	c.demandRetryAfter = time.Time{}
+	activityRecovery := !c.keepaliveEnabledLocked() && c.activityRecoveryActiveLocked()
+	c.outstandingProbeID = 0
+	c.probeStartedAt = time.Time{}
+	c.lastProbeQueuedAt = time.Time{}
 	c.keepaliveDeadline = time.Time{}
 	c.keepaliveTimeouts = 0
 
 	switch {
 	case c.attempt != nil:
 		c.nextKeepalive = time.Time{}
+		c.keepaliveProofBaseline = time.Time{}
+		// A replacement transport is a materially new network condition. Give the
+		// active attempt a fresh bounded budget rather than letting an old-path
+		// deadline immediately discard the first retry on the new path.
+		c.attemptStartedAt = now
 		c.nextAction = now
+		wake = true
+	case c.keepaliveEnabledLocked() && c.core.peer.currentTXEligible(now):
+		// Persistent keepalive explicitly asks for background reachability. On a
+		// new outer path, refresh the mapping/endpoint immediately.
+		c.nextKeepalive = now
+		c.keepaliveProofBaseline = c.refreshLastPeerProofLocked()
+		c.pathNeedsProof = false
+		wake = true
+	case c.keepaliveEnabledLocked():
+		c.nextKeepalive = time.Time{}
+		c.keepaliveProofBaseline = time.Time{}
+		c.pathNeedsProof = false
+		c.nextAction = now
+		wake = true
 	case c.core.peer.currentTXEligible(now):
-		if c.keepaliveEnabledLocked() {
+		// Rebound invalidates knowledge about the outer path, but an idle Session
+		// must remain silent. The next admitted DATA will request proof. If DATA had
+		// already activated recovery on the old path, preserve that demand and probe
+		// immediately on the replacement transport.
+		c.pathNeedsProof = true
+		if activityRecovery {
 			c.nextKeepalive = now
+			wake = true
+		} else {
+			c.nextKeepalive = time.Time{}
 		}
 	default:
 		c.nextKeepalive = time.Time{}
-		c.nextAction = now
+		c.keepaliveProofBaseline = time.Time{}
+		c.pathNeedsProof = false
 	}
 	c.mu.Unlock()
-	c.signalWake()
+	if wake {
+		c.signalWake()
+	}
 }
 
-// HandleAuthenticatedACK consumes an already-authenticated ACK as a liveness
-// signal only. It intentionally has no authority over traffic-generation
-// installation, promotion or rollback.
-func (c *SessionController) HandleAuthenticatedACK(keepaliveID uint64) {
-	if c == nil || keepaliveID == 0 {
+// HandleOutboundDemand is called before admitting one application DATA packet.
+// It keeps a usable current Session on the fast path, starts first-use or
+// hard-expiry establishment when needed, and turns soft rekey into a demand-
+// driven make-before-break operation when persistent keepalive is disabled.
+// The returned wait closes Usable when DATA may be admitted through current, or
+// Abandoned if a bounded no-current establishment cycle ends first.
+func (c *SessionController) HandleOutboundDemand() OutboundDemandWait {
+	if c == nil {
+		return OutboundDemandWait{}
+	}
+
+	now := c.clock.Now()
+	wake := false
+	c.mu.Lock()
+	if c.core.peer.currentTXEligible(now) {
+		c.closeUsableLocked()
+		c.openDemandAbandonedLocked()
+		if c.attempt == nil && c.softRekeyDueLocked(now) &&
+			(c.nextAction.IsZero() || c.nextAction.After(now)) {
+			c.nextAction = now
+			wake = true
+		}
+	} else {
+		c.openUsableLocked()
+		if c.attempt == nil && !c.demandRetryAfter.IsZero() && now.Before(c.demandRetryAfter) {
+			// A just-exhausted no-current cycle may have left a device/TUN backlog.
+			// Drop that backlog without allowing each queued packet to buy another
+			// complete establishment budget. No timer is needed: the first DATA after
+			// the cool-off will activate a new cycle normally.
+			c.closeDemandAbandonedLocked()
+		} else if c.attempt == nil {
+			c.demandRetryAfter = time.Time{}
+			c.openDemandAbandonedLocked()
+		}
+		c.clearKeepaliveLocked()
+		if c.attempt == nil && !c.demandAbandonedClosed &&
+			(c.nextAction.IsZero() || c.nextAction.After(now)) {
+			c.nextAction = now
+			wake = true
+		}
+	}
+	wait := OutboundDemandWait{
+		Usable:    c.usable,
+		Abandoned: c.demandAbandoned,
+	}
+	c.mu.Unlock()
+	if wake {
+		c.signalWake()
+	}
+	return wait
+}
+
+// HandleOutboundActivity reports one admitted ordinary DATA transmission.
+// If the current generation has not produced authenticated reverse traffic for
+// activityProbeIdle, the controller schedules one immediate liveness probe.
+// Further DATA does not create additional probes while one is outstanding.
+func (c *SessionController) HandleOutboundActivity() {
+	if c == nil {
 		return
 	}
 
 	now := c.clock.Now()
-	matched := false
+	wake := false
 	c.mu.Lock()
-	if c.keepaliveID == keepaliveID {
-		matched = true
-		c.keepaliveID = 0
-		c.keepaliveDeadline = time.Time{}
-		c.keepaliveTimeouts = 0
-		if c.keepaliveEnabledLocked() && c.attempt == nil {
-			c.nextKeepalive = now.Add(c.nextKeepaliveDelay())
+	if c.attempt == nil && c.outstandingProbeID == 0 {
+		lastProof := c.refreshLastPeerProofLocked()
+		if c.pathNeedsProof || lastProof.IsZero() || now.Sub(lastProof) >= activityProbeIdle {
+			if c.nextKeepalive.IsZero() || c.nextKeepalive.After(now) {
+				c.nextKeepalive = now
+				c.keepaliveProofBaseline = lastProof
+				wake = true
+			}
+		} else if c.keepaliveEnabledLocked() {
+			// Ordinary DATA already refreshes the outer NAT mapping, so periodic
+			// keepalive is measured from this real traffic rather than emitted on
+			// top of an active tunnel.
+			c.schedulePersistentKeepaliveLocked(now)
 		}
 	}
 	c.mu.Unlock()
-	if matched {
+	if wake {
 		c.signalWake()
 	}
 }
@@ -380,9 +537,11 @@ func (c *SessionController) HandleDatagram(
 	return true, nil
 }
 
-// Run drives time-based rekey and establishment retry. Runtime owns socket
-// lifetime; when runtime Done closes, controller exits without generating more
-// protocol traffic.
+// Run drives scheduled establishment retry and optional persistent keepalive.
+// With persistent keepalive disabled, an idle usable Session has no timer here;
+// first use and soft rekey are activated by HandleOutboundDemand. Runtime owns
+// socket lifetime; when runtime Done closes, controller exits without generating
+// more protocol traffic.
 func (c *SessionController) Run(ctx context.Context) error {
 	if c == nil {
 		return fmt.Errorf("session controller is nil: %w", dataplane.ErrInvalidConfig)
@@ -405,6 +564,17 @@ func (c *SessionController) Run(ctx context.Context) error {
 		c.mu.Lock()
 		next := c.nextDueLocked()
 		c.mu.Unlock()
+
+		if next.IsZero() {
+			select {
+			case <-c.wake:
+			case <-c.runtime.Done():
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			continue
+		}
 
 		if !next.After(now) {
 			if err := c.runDue(now); err != nil {
@@ -432,30 +602,52 @@ func (c *SessionController) runDue(now time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// A missing ACK is evidence that the installed generation may no longer
-	// exist at the peer or that packets are being lost. Protocol recovery is the
-	// ordinary fresh-establishment path; socket lifetime remains runtime policy.
+	// Missing authenticated current-generation RX after a probe is evidence that
+	// the installed generation may no longer exist at the peer or that the path
+	// is losing traffic. Protocol recovery is ordinary fresh establishment;
+	// socket lifetime remains runtime policy.
 	if !c.keepaliveDeadline.IsZero() && !c.keepaliveDeadline.After(now) {
-		c.keepaliveID = 0
-		c.keepaliveDeadline = time.Time{}
-		c.keepaliveTimeouts++
+		lastProof := c.refreshLastPeerProofLocked()
+		if !c.probeStartedAt.IsZero() && lastProof.After(c.probeStartedAt) {
+			lastProbeAt := c.lastProbeQueuedAt
+			c.outstandingProbeID = 0
+			c.probeStartedAt = time.Time{}
+			c.lastProbeQueuedAt = time.Time{}
+			c.keepaliveDeadline = time.Time{}
+			c.keepaliveTimeouts = 0
+			if c.keepaliveEnabledLocked() && c.attempt == nil {
+				c.schedulePersistentKeepaliveLocked(lastProbeAt)
+				if c.nextKeepalive.Before(now) {
+					c.nextKeepalive = now
+				}
+			} else {
+				c.nextKeepalive = time.Time{}
+			}
+		} else {
+			c.outstandingProbeID = 0
+			c.lastProbeQueuedAt = time.Time{}
+			c.keepaliveDeadline = time.Time{}
+			c.keepaliveTimeouts++
+		}
+
 		if c.keepaliveTimeouts >= keepaliveTimeoutsBeforeRekey {
 			c.nextKeepalive = time.Time{}
+			c.probeStartedAt = time.Time{}
 			c.keepaliveTimeouts = 0
-			if c.attempt == nil && c.nextAction.After(now) {
+			if c.attempt == nil && (c.nextAction.IsZero() || c.nextAction.After(now)) {
 				c.nextAction = now
 			}
-		} else if c.keepaliveEnabledLocked() && c.attempt == nil {
-			// A single lost UDP KEEPALIVE or ACK must not force a Noise exchange. Retry
-			// liveness immediately with a fresh KEEPALIVE/sequence; only consecutive
-			// timeouts escalate to establishment.
+		} else if c.keepaliveTimeouts > 0 && c.attempt == nil {
+			// One probe without authenticated reverse traffic must not force a Noise
+			// exchange. Retry liveness once with a fresh KEEPALIVE/sequence.
 			c.nextKeepalive = now
 		}
 	}
 
-	if !c.nextAction.After(now) {
+	if !c.nextAction.IsZero() && !c.nextAction.After(now) {
 		if c.attempt == nil {
 			c.clearKeepaliveLocked()
+			c.openDemandAbandonedLocked()
 			attempt, update, err := c.factory.Start(now)
 			if err != nil {
 				return fmt.Errorf("start establishment: %w", err)
@@ -467,12 +659,20 @@ func (c *SessionController) runDue(now time.Time) error {
 				)
 			}
 			c.attempt = attempt
+			if c.attempt != nil {
+				c.attemptStartedAt = now
+			}
 			if err := c.applyUpdateLocked(now, update); err != nil {
 				return err
 			}
 			if c.attempt != nil {
-				c.nextAction = now.Add(c.nextEstablishmentRetryDelay())
+				c.scheduleNextEstablishmentActionLocked(now)
 			}
+			return nil
+		}
+
+		if c.establishmentAttemptExpiredLocked(now) {
+			c.abandonEstablishmentLocked(now)
 			return nil
 		}
 
@@ -484,27 +684,48 @@ func (c *SessionController) runDue(now time.Time) error {
 			return err
 		}
 		if c.attempt != nil {
-			c.nextAction = now.Add(c.nextEstablishmentRetryDelay())
+			c.scheduleNextEstablishmentActionLocked(now)
 		}
 		return nil
 	}
 
-	if c.keepaliveEnabledLocked() &&
-		c.attempt == nil &&
-		c.keepaliveID == 0 &&
+	if c.attempt == nil &&
+		c.outstandingProbeID == 0 &&
 		!c.nextKeepalive.IsZero() &&
 		!c.nextKeepalive.After(now) {
+		if c.keepaliveEnabledLocked() && c.probeStartedAt.IsZero() && c.keepaliveTimeouts == 0 {
+			lastProof := c.refreshLastPeerProofLocked()
+			if lastProof.After(c.keepaliveProofBaseline) {
+				c.schedulePersistentKeepaliveLocked(lastProof)
+				if c.nextKeepalive.After(now) {
+					return nil
+				}
+			}
+		}
 		keepaliveID := c.nextKeepaliveIDLocked()
 		op, err := c.core.AdmitKeepalive(keepaliveID, dataplane.MaxGeneratedControlWirePacketSize)
 		if err != nil {
+			if errors.Is(err, ErrNoCurrentSession) || errors.Is(err, ErrSessionNotTXEligible) {
+				c.clearKeepaliveLocked()
+				if c.attempt == nil && (c.nextAction.IsZero() || c.nextAction.After(now)) {
+					c.nextAction = now
+				}
+				return nil
+			}
 			return fmt.Errorf("admit keepalive: %w", err)
 		}
 		if err := c.runtime.SubmitProtocolTransport(op); err != nil {
 			return fmt.Errorf("submit keepalive: %w", err)
 		}
-		c.keepaliveID = keepaliveID
-		c.keepaliveDeadline = now.Add(c.config.KeepaliveTimeout)
+		queuedAt := c.clock.Now()
+		c.outstandingProbeID = keepaliveID
+		if c.probeStartedAt.IsZero() {
+			c.probeStartedAt = queuedAt
+		}
+		c.lastProbeQueuedAt = queuedAt
+		c.keepaliveDeadline = queuedAt.Add(c.keepaliveTimeoutLocked())
 		c.nextKeepalive = time.Time{}
+		c.pathNeedsProof = false
 	}
 
 	return nil
@@ -559,15 +780,22 @@ func (c *SessionController) applyUpdateLocked(
 	}
 
 	c.attempt = nil
+	c.attemptStartedAt = time.Time{}
 	installedAt, ok := c.core.peer.currentInstalledAt()
 	if !ok {
 		return fmt.Errorf("installed current session is missing: %w", dataplane.ErrInvalidConfig)
 	}
-	c.nextAction = installedAt.Add(c.config.SoftRekeyAfter)
+	c.nextAction = time.Time{}
+	c.demandRetryAfter = time.Time{}
+	c.lastPeerProof = installedAt
+	c.pathNeedsProof = false
 	c.clearKeepaliveLocked()
 	if c.keepaliveEnabledLocked() {
-		c.nextKeepalive = now.Add(c.nextKeepaliveDelay())
+		c.nextAction = installedAt.Add(c.config.SoftRekeyAfter)
+		c.schedulePersistentKeepaliveLocked(installedAt)
 	}
+	c.closeUsableLocked()
+	c.openDemandAbandonedLocked()
 	if !c.readyClosed {
 		close(c.ready)
 		c.readyClosed = true
@@ -579,11 +807,138 @@ func (c *SessionController) keepaliveEnabledLocked() bool {
 	return c.config.KeepaliveIntervalMin > 0
 }
 
+func (c *SessionController) activityRecoveryActiveLocked() bool {
+	return c.outstandingProbeID != 0 ||
+		!c.probeStartedAt.IsZero() ||
+		!c.keepaliveDeadline.IsZero() ||
+		c.keepaliveTimeouts > 0 ||
+		!c.nextKeepalive.IsZero()
+}
+
+func (c *SessionController) keepaliveTimeoutLocked() time.Duration {
+	if c.config.KeepaliveTimeout > 0 {
+		return c.config.KeepaliveTimeout
+	}
+	return defaultActivityProbeTimeout
+}
+
+func (c *SessionController) refreshLastPeerProofLocked() time.Time {
+	if lastRX := c.core.peer.lastAuthenticatedCurrentRX(); lastRX.After(c.lastPeerProof) {
+		c.lastPeerProof = lastRX
+	}
+	return c.lastPeerProof
+}
+
+func (c *SessionController) softRekeyDueLocked(now time.Time) bool {
+	installedAt, ok := c.core.peer.currentInstalledAt()
+	return ok && !now.Before(installedAt.Add(c.config.SoftRekeyAfter))
+}
+
+func (c *SessionController) establishmentAttemptTimeoutLocked() time.Duration {
+	if c.config.EstablishmentAttemptTimeout > 0 {
+		return c.config.EstablishmentAttemptTimeout
+	}
+	return defaultEstablishmentAttemptTimeout
+}
+
+func (c *SessionController) postAbandonDemandCooldownLocked() time.Duration {
+	if c.config.EstablishmentRetryMax < maxPostAbandonDemandCooldown {
+		return c.config.EstablishmentRetryMax
+	}
+	return maxPostAbandonDemandCooldown
+}
+
+func (c *SessionController) establishmentAttemptExpiredLocked(now time.Time) bool {
+	return c.attempt != nil &&
+		!c.attemptStartedAt.IsZero() &&
+		!now.Before(c.attemptStartedAt.Add(c.establishmentAttemptTimeoutLocked()))
+}
+
+func (c *SessionController) scheduleNextEstablishmentActionLocked(now time.Time) {
+	deadline := c.attemptStartedAt.Add(c.establishmentAttemptTimeoutLocked())
+	next := now.Add(c.nextEstablishmentRetryDelay())
+	if next.After(deadline) {
+		next = deadline
+	}
+	c.nextAction = next
+}
+
+func (c *SessionController) abandonEstablishmentLocked(now time.Time) {
+	c.attempt = nil
+	c.attemptStartedAt = time.Time{}
+	c.nextAction = time.Time{}
+	c.clearKeepaliveLocked()
+
+	if c.core.peer.currentTXEligible(now) {
+		c.closeUsableLocked()
+		if c.keepaliveEnabledLocked() {
+			// The bounded Noise cycle itself produced recent outbound traffic. Resume
+			// the explicitly requested idle keepalive policy from here, but do not
+			// immediately start another establishment cycle.
+			c.schedulePersistentKeepaliveLocked(now)
+		}
+		return
+	}
+
+	// A packet waiting for first-use/hard-expiry establishment must not keep one
+	// failed demand alive forever. Wake its owner so that packet can be dropped.
+	// Suppress ordinary DATA briefly so already-queued device backlog cannot
+	// immediately start another complete establishment budget. Persistent
+	// keepalive is explicit background-connectivity demand, so after an exhausted
+	// cycle it may start a fresh bounded cycle at its normal cadence.
+	c.demandRetryAfter = now.Add(c.postAbandonDemandCooldownLocked())
+	c.openUsableLocked()
+	c.closeDemandAbandonedLocked()
+	if c.keepaliveEnabledLocked() {
+		c.nextAction = now.Add(c.nextKeepaliveDelay())
+	}
+}
+
+func (c *SessionController) openUsableLocked() {
+	if c.usableOpen {
+		return
+	}
+	c.usable = make(chan struct{})
+	c.usableOpen = true
+}
+
+func (c *SessionController) openDemandAbandonedLocked() {
+	if !c.demandAbandonedClosed {
+		return
+	}
+	c.demandAbandoned = make(chan struct{})
+	c.demandAbandonedClosed = false
+}
+
+func (c *SessionController) closeDemandAbandonedLocked() {
+	if c.demandAbandonedClosed {
+		return
+	}
+	close(c.demandAbandoned)
+	c.demandAbandonedClosed = true
+}
+
+func (c *SessionController) closeUsableLocked() {
+	if !c.usableOpen {
+		return
+	}
+	close(c.usable)
+	c.usableOpen = false
+}
+
 func (c *SessionController) clearKeepaliveLocked() {
 	c.nextKeepalive = time.Time{}
-	c.keepaliveID = 0
+	c.keepaliveProofBaseline = time.Time{}
+	c.outstandingProbeID = 0
+	c.probeStartedAt = time.Time{}
+	c.lastProbeQueuedAt = time.Time{}
 	c.keepaliveDeadline = time.Time{}
 	c.keepaliveTimeouts = 0
+}
+
+func (c *SessionController) schedulePersistentKeepaliveLocked(base time.Time) {
+	c.keepaliveProofBaseline = c.refreshLastPeerProofLocked()
+	c.nextKeepalive = base.Add(c.nextKeepaliveDelay())
 }
 
 func (c *SessionController) nextKeepaliveIDLocked() uint64 {

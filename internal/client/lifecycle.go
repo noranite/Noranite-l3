@@ -61,9 +61,10 @@ type Peer struct {
 	// Direct callers are serialized; the RX engine uses its ordered owner path.
 	rxCompatMu sync.Mutex
 
-	lifecycle LifecycleConfig
-	current   sessionSlot
-	previous  sessionSlot
+	lifecycle                  LifecycleConfig
+	current                    sessionSlot
+	previous                   sessionSlot
+	lastCurrentAuthenticatedRX time.Time
 }
 
 func NewPeer(
@@ -112,6 +113,7 @@ func (p *Peer) InstallInitiatorSession(
 		session:  session,
 		rejectAt: now.Add(p.lifecycle.GenerationLifetime),
 	}
+	p.lastCurrentAuthenticatedRX = time.Time{}
 	return retired, nil
 }
 
@@ -169,11 +171,17 @@ func (p *Peer) commitAuthenticatedRXOwned(
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if p.current.session != candidate {
+		return RXCommitResult{}, nil
+	}
+	if admission.ReceivedAt.After(p.lastCurrentAuthenticatedRX) {
+		p.lastCurrentAuthenticatedRX = admission.ReceivedAt
+	}
+
 	// Exact identity is the stale-completion guard. A packet admitted on B but
 	// committed after Install(C) may update B's Session-local replay/endpoint
 	// state, but it cannot arm retirement of B while C is current.
-	if p.current.session != candidate ||
-		p.previous.session == nil ||
+	if p.previous.session == nil ||
 		!p.previous.shortRejectAt.IsZero() {
 		return RXCommitResult{}, nil
 	}
@@ -215,6 +223,12 @@ func (p *Peer) currentTXEligible(now time.Time) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.current.session != nil && now.Before(p.current.rejectAt)
+}
+
+func (p *Peer) lastAuthenticatedCurrentRX() time.Time {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.lastCurrentAuthenticatedRX
 }
 
 // currentInstalledAt returns the installation time of current, derived from the

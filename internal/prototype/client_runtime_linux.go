@@ -42,14 +42,6 @@ type ClientDatagramDemux interface {
 	) (handled bool, err error)
 }
 
-// ClientAuthenticatedEventSink receives already-authenticated protocol events
-// after ordered RX commit. It is deliberately separate from raw datagram demux:
-// callers can use ACK for keepalive/reconnect policy without making it part of
-// Session lifecycle correctness.
-type ClientAuthenticatedEventSink interface {
-	HandleAuthenticatedACK(keepaliveID uint64)
-}
-
 // ClientDatagramDemuxFunc adapts a function to ClientDatagramDemux.
 type ClientDatagramDemuxFunc func(
 	source netip.AddrPort,
@@ -100,7 +92,6 @@ type ClientRuntime struct {
 
 	// rxTunWrite is owned exclusively by RXEngine's one sequential consumer.
 	rxTunWrite [][]byte
-	eventSink  ClientAuthenticatedEventSink
 
 	stateMu sync.Mutex
 	started bool
@@ -221,8 +212,8 @@ func NewClientRuntime(
 }
 
 // consumeRXResults is the final ordered owner of authenticated client RX
-// packets. It performs the TUN/event side effects synchronously; RXEngine
-// returns packet buffers to their pools immediately after this method returns.
+// packets. It performs TUN delivery synchronously; RXEngine returns packet
+// buffers to their pools immediately after this method returns.
 func (r *ClientRuntime) consumeRXResults(results []client.RXResult) error {
 	tunWrite := r.rxTunWrite[:0]
 	defer func() {
@@ -254,9 +245,7 @@ func (r *ClientRuntime) consumeRXResults(results []client.RXResult) error {
 			)
 
 		case dataplane.InboundACK:
-			if r.eventSink != nil {
-				r.eventSink.HandleAuthenticatedACK(result.Inbound.KeepaliveID)
-			}
+			continue
 
 		default:
 			r.reporter.Report(fmt.Errorf(
@@ -399,9 +388,6 @@ func (r *ClientRuntime) Run() error {
 	}
 	r.started = true
 	demux := r.demux
-	if sink, ok := demux.(ClientAuthenticatedEventSink); ok {
-		r.eventSink = sink
-	}
 	r.stateMu.Unlock()
 
 	r.protocolMu.Lock()

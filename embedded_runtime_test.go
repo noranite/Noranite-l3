@@ -64,7 +64,8 @@ func TestClientWaitReadyBlocksWithoutEstablishedSession(t *testing.T) {
 
 func TestClientOfflineStartupThenTransportAvailable(t *testing.T) {
 	device := newTestPacketDevice()
-	client, err := NewClient(testPublicClientConfig(t, DefaultMTU), device, nil)
+	config := testPublicClientConfig(t, DefaultMTU)
+	client, err := NewClient(config, device, nil)
 	if err != nil {
 		t.Fatalf("NewClient without transport: %v", err)
 	}
@@ -86,16 +87,26 @@ func TestClientOfflineStartupThenTransportAvailable(t *testing.T) {
 	if generation != 1 {
 		t.Fatalf("replacement generation=%d, want 1", generation)
 	}
-	if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	if err := peer.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
 	buffer := make([]byte, dataplane.MaxGeneratedEstablishmentWirePacketSize)
+	if _, err := peer.Read(buffer); err == nil {
+		t.Fatal("transport replacement activated an otherwise idle client")
+	} else if timeout, ok := err.(net.Error); !ok || !timeout.Timeout() {
+		t.Fatalf("idle transport read error=%v, want timeout", err)
+	}
+
+	device.inject(testIPv4Packet(config.TunnelIPv4, netip.MustParseAddr("10.66.0.1"), 96))
+	if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	n, err := peer.Read(buffer)
 	if err != nil {
-		t.Fatalf("read establishment after transport availability: %v", err)
+		t.Fatalf("read establishment after first DATA: %v", err)
 	}
 	if n == 0 {
-		t.Fatal("transport availability did not trigger establishment retry")
+		t.Fatal("first DATA did not trigger establishment")
 	}
 
 	if err := client.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
@@ -108,6 +119,44 @@ func TestClientOfflineStartupThenTransportAvailable(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Client.Run did not stop after Close")
+	}
+}
+
+func TestClientCloseWhileOutboundDataWaitsForEstablishment(t *testing.T) {
+	device := newTestPacketDevice()
+	transport, peer := net.Pipe()
+	defer peer.Close()
+
+	config := testPublicClientConfig(t, DefaultMTU)
+	client, err := NewClient(config, device, transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- client.Run(context.Background()) }()
+
+	device.inject(testIPv4Packet(config.TunnelIPv4, netip.MustParseAddr("10.66.0.1"), 96))
+	if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, dataplane.MaxGeneratedEstablishmentWirePacketSize)
+	if _, err := peer.Read(buffer); err != nil {
+		t.Fatalf("read first establishment datagram: %v", err)
+	}
+
+	// The DATA packet is now held waiting for a Session. Shutdown must wake that
+	// waiter and let Run finish even though no runtime worker reports an error.
+	if err := client.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("client.Close: %v", err)
+	}
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Client.Run returned after Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Client.Run did not stop while DATA waited for establishment")
 	}
 }
 
@@ -1066,12 +1115,6 @@ func TestClientRunNoiseEstablishmentAndDataRoundTrip(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- client.Run(context.Background()) }()
 
-	readyCtx, readyCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer readyCancel()
-	if err := client.WaitReady(readyCtx); err != nil {
-		t.Fatalf("WaitReady: %v", err)
-	}
-
 	request := testIPv4Packet(clientIP, serverIP, 128)
 	device.inject(request)
 	select {
@@ -1259,6 +1302,7 @@ func TestClientReplaceTransportDuringEstablishment(t *testing.T) {
 
 	runDone := make(chan error, 1)
 	go func() { runDone <- client.Run(context.Background()) }()
+	device.inject(testIPv4Packet(clientIP, netip.MustParseAddr("10.66.0.1"), 96))
 
 	var firstSource netip.AddrPort
 	select {

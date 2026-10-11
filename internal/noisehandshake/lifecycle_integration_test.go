@@ -45,6 +45,7 @@ func TestNoiseLifecycleColdStartActivatesPendingGeneration(t *testing.T) {
 	)
 	defer h.close(t)
 
+	h.controller.HandleOutboundDemand()
 	init := h.waitInit(t)
 	response := h.processInit(t, init)
 	if current := h.serverCore.CurrentSession(h.clientIP); current != nil {
@@ -543,6 +544,7 @@ func (h *noiseLifecycleHarness) deliverTransport(t *testing.T, op *coreclient.Ou
 
 func (h *noiseLifecycleHarness) establishCurrent(t *testing.T, sessionID uint64) {
 	t.Helper()
+	h.controller.HandleOutboundDemand()
 	init := h.waitInit(t)
 	response := h.processInit(t, init)
 	h.deliverResponse(t, response)

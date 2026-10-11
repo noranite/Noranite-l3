@@ -78,32 +78,38 @@ func main() {
 
 	establishmentRetryMin := flag.Duration(
 		"establishment-retry-min",
-		2500*time.Millisecond,
+		5*time.Second,
 		"minimum Session establishment retry delay",
 	)
 
 	establishmentRetryMax := flag.Duration(
 		"establishment-retry-max",
-		3500*time.Millisecond,
+		6*time.Second,
 		"maximum Session establishment retry delay",
+	)
+
+	establishmentAttemptTimeout := flag.Duration(
+		"establishment-attempt-timeout",
+		90*time.Second,
+		"maximum duration of one continuous Session establishment cycle",
 	)
 
 	keepaliveIntervalMin := flag.Duration(
 		"keepalive-interval-min",
-		25*time.Second,
+		0,
 		"minimum authenticated Session KEEPALIVE interval (all keepalive values 0 disables)",
 	)
 
 	keepaliveIntervalMax := flag.Duration(
 		"keepalive-interval-max",
-		35*time.Second,
+		0,
 		"maximum authenticated Session KEEPALIVE interval (all keepalive values 0 disables)",
 	)
 
 	keepaliveTimeout := flag.Duration(
 		"keepalive-timeout",
-		2*time.Second,
-		"authenticated Session KEEPALIVE ACK timeout (all keepalive values 0 disables)",
+		0,
+		"authenticated Session liveness probe timeout (all keepalive values 0 disables periodic keepalive)",
 	)
 
 	flag.Parse()
@@ -182,12 +188,13 @@ func main() {
 		runtime,
 		factory,
 		client.SessionControllerConfig{
-			SoftRekeyAfter:        *softRekeyAfter,
-			EstablishmentRetryMin: *establishmentRetryMin,
-			EstablishmentRetryMax: *establishmentRetryMax,
-			KeepaliveIntervalMin:  *keepaliveIntervalMin,
-			KeepaliveIntervalMax:  *keepaliveIntervalMax,
-			KeepaliveTimeout:      *keepaliveTimeout,
+			SoftRekeyAfter:              *softRekeyAfter,
+			EstablishmentRetryMin:       *establishmentRetryMin,
+			EstablishmentRetryMax:       *establishmentRetryMax,
+			EstablishmentAttemptTimeout: *establishmentAttemptTimeout,
+			KeepaliveIntervalMin:        *keepaliveIntervalMin,
+			KeepaliveIntervalMax:        *keepaliveIntervalMax,
+			KeepaliveTimeout:            *keepaliveTimeout,
 		},
 	)
 	if err != nil {
@@ -203,7 +210,7 @@ func main() {
 
 	actualName, _ := dev.Name()
 	log.Printf(
-		"client started: tun=%s tunnel=%s udp=%s server=%s establishment=noise-ik session=none soft_rekey_after=%s retry=%s..%s keepalive_interval=%s..%s keepalive_timeout=%s",
+		"client started: tun=%s tunnel=%s udp=%s server=%s establishment=noise-ik session=none soft_rekey_after=%s retry=%s..%s attempt_timeout=%s keepalive_interval=%s..%s keepalive_timeout=%s",
 		actualName,
 		tunnelIPv4,
 		conn.LocalAddr(),
@@ -211,11 +218,18 @@ func main() {
 		*softRekeyAfter,
 		*establishmentRetryMin,
 		*establishmentRetryMax,
+		*establishmentAttemptTimeout,
 		*keepaliveIntervalMin,
 		*keepaliveIntervalMax,
 		*keepaliveTimeout,
 	)
 
+	// The standalone Linux client exists primarily for live/fault tests and has no
+	// embedded demand/activity hook. Keep bootstrap intentionally eager, but let
+	// the controller's bounded establishment budget prevent an unreachable peer
+	// from causing retries forever. This prototype therefore does not model the
+	// production client's long-lived lazy reactivation after a cycle is exhausted.
+	controller.RequestRekey()
 	err = runClient(runtime, core, controller)
 
 	if errors.Is(err, os.ErrClosed) ||

@@ -30,8 +30,9 @@ type clientDatagramDemux interface {
 	) (handled bool, err error)
 }
 
-type clientAuthenticatedEventSink interface {
-	HandleAuthenticatedACK(keepaliveID uint64)
+type clientActivityEventSink interface {
+	HandleOutboundDemand() coreclient.OutboundDemandWait
+	HandleOutboundActivity()
 }
 
 type embeddedRuntime struct {
@@ -49,7 +50,7 @@ type embeddedRuntime struct {
 
 	rxDeviceWrite [][]byte
 	demux         clientDatagramDemux
-	eventSink     clientAuthenticatedEventSink
+	eventSink     clientActivityEventSink
 
 	errC              chan error
 	transportFailures chan TransportFailure
@@ -72,6 +73,7 @@ type embeddedRuntime struct {
 	started bool
 	ready   chan struct{}
 	done    chan struct{}
+	stop    chan struct{}
 
 	closeOnce      sync.Once
 	closeErr       error
@@ -138,6 +140,7 @@ func newEmbeddedRuntime(
 		transportFailures: make(chan TransportFailure, 1),
 		ready:             make(chan struct{}),
 		done:              make(chan struct{}),
+		stop:              make(chan struct{}),
 	}
 	if transport != nil {
 		r.transportID = 1
@@ -283,6 +286,8 @@ func (r *embeddedRuntime) closeIngress(requested bool) error {
 	}
 
 	r.closeOnce.Do(func() {
+		close(r.stop)
+
 		r.transportMu.Lock()
 		r.transportClosing = true
 		transport := r.transport
@@ -415,13 +420,17 @@ func (r *embeddedRuntime) Run() error {
 
 	close(r.ready)
 
-	firstErr := <-r.errC
+	var firstErr error
+	select {
+	case firstErr = <-r.errC:
+	case <-r.stop:
+		firstErr = net.ErrClosed
+	}
 	r.closeIngress(false)
 	ingressWG.Wait()
 	r.transportWG.Wait()
 
-	// RX may synchronously notify SessionController while consuming accepted
-	// packets, so protocol TX remains open until accepted RX is fully drained.
+	// Keep protocol TX open until accepted RX is fully drained.
 	r.rxEngine.Close()
 
 	r.protocolMu.Lock()
@@ -465,18 +474,52 @@ func (r *embeddedRuntime) runDeviceIngress() error {
 
 		inner := buffer[dataplane.RouteSize : dataplane.RouteSize+size]
 		submission := &submissions[0]
-		if err := r.core.AdmitInnerPacketInto(&submission.Operation, inner, cap(buffer)); err != nil {
+		admitted := false
+		abandoned := false
+
+		for {
+			if r.eventSink != nil {
+				demand := r.eventSink.HandleOutboundDemand()
+				select {
+				case <-demand.Usable:
+				case <-demand.Abandoned:
+					abandoned = true
+				case <-r.stop:
+					return nil
+				}
+				if abandoned {
+					break
+				}
+			}
+
+			err := r.core.AdmitInnerPacketInto(&submission.Operation, inner, cap(buffer))
+			if err == nil {
+				admitted = true
+				break
+			}
+			if r.eventSink != nil &&
+				(errors.Is(err, coreclient.ErrNoCurrentSession) || errors.Is(err, coreclient.ErrSessionNotTXEligible)) {
+				// The Session may have crossed its hard deadline between the demand
+				// check and admission. Keep this one packet and establish a fresh one.
+				continue
+			}
 			if errors.Is(err, dataplane.ErrSequenceExhausted) ||
 				errors.Is(err, dataplane.ErrBufferTooSmall) ||
 				errors.Is(err, dataplane.ErrInvalidConfig) {
 				return fmt.Errorf("admit embedded device packet: %w", err)
 			}
+			break
+		}
+		if abandoned || !admitted {
 			continue
 		}
 		submission.Buffer = buffer[:0]
 
 		if err := r.txEngine.EnqueueOwnedBatch(submissions, r.txPool); err != nil {
 			return fmt.Errorf("enqueue embedded device TX: %w", err)
+		}
+		if r.eventSink != nil {
+			r.eventSink.HandleOutboundActivity()
 		}
 		*submission = coreclient.TXOwnedSubmission{}
 
@@ -592,9 +635,7 @@ func (r *embeddedRuntime) consumeRXResults(results []coreclient.RXResult) error 
 			write = append(write, result.Buffer[:dataplane.RouteSize+len(inner)])
 
 		case dataplane.InboundACK:
-			if r.eventSink != nil {
-				r.eventSink.HandleAuthenticatedACK(result.Inbound.KeepaliveID)
-			}
+			continue
 
 		default:
 			r.report(fmt.Errorf("unexpected embedded client inbound kind %v", result.Inbound.Kind))
