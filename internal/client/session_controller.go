@@ -129,6 +129,26 @@ type EstablishmentUpdate struct {
 	Material *establishment.TrafficSessionMaterial
 }
 
+// SessionEventKind identifies a sparse establishment lifecycle event.
+type SessionEventKind uint8
+
+const (
+	SessionEventEstablishmentStarted SessionEventKind = iota + 1
+	SessionEventEstablished
+	SessionEventEstablishmentAbandoned
+)
+
+// SessionEvent contains only aggregate lifecycle diagnostics, never packet
+// contents or cryptographic material.
+type SessionEvent struct {
+	Kind         SessionEventKind
+	Duration     time.Duration
+	TXDatagrams  uint32
+	RXCandidates uint32
+}
+
+type SessionEventHandler func(SessionEvent)
+
 // EstablishmentAttempt is one event-driven client establishment attempt.
 //
 // HandleDatagram must not retain packet: runtime receive storage is reusable.
@@ -202,6 +222,9 @@ type SessionController struct {
 
 	attempt               EstablishmentAttempt
 	attemptStartedAt      time.Time
+	attemptTXDatagrams    uint32
+	attemptRXCandidates   uint32
+	eventHandler          SessionEventHandler
 	nextAction            time.Time
 	demandRetryAfter      time.Time
 	usable                chan struct{}
@@ -232,6 +255,18 @@ func NewSessionController(
 	config SessionControllerConfig,
 ) (*SessionController, error) {
 	return newSessionController(core, runtime, factory, config, wallSessionControllerClock{})
+}
+
+// SetEventHandler installs a sparse lifecycle observer. The handler is called
+// synchronously while the controller state is locked and therefore must not block.
+// Production Client wiring uses a non-blocking buffered channel.
+func (c *SessionController) SetEventHandler(handler SessionEventHandler) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.eventHandler = handler
+	c.mu.Unlock()
 }
 
 func newSessionController(
@@ -520,6 +555,7 @@ func (c *SessionController) HandleDatagram(
 		return true, nil
 	}
 
+	c.attemptRXCandidates++
 	handled, update, err := c.attempt.HandleDatagram(now, source, route, routeDecoded, packet)
 	if err != nil {
 		return true, fmt.Errorf("handle establishment datagram: %w", err)
@@ -661,6 +697,9 @@ func (c *SessionController) runDue(now time.Time) error {
 			c.attempt = attempt
 			if c.attempt != nil {
 				c.attemptStartedAt = now
+				c.attemptTXDatagrams = 0
+				c.attemptRXCandidates = 0
+				c.emitSessionEventLocked(SessionEventEstablishmentStarted, now)
 			}
 			if err := c.applyUpdateLocked(now, update); err != nil {
 				return err
@@ -748,6 +787,7 @@ func (c *SessionController) applyUpdateLocked(
 		if err := c.runtime.SendProtocolDatagram(datagram.Packet, datagram.Destination); err != nil {
 			return fmt.Errorf("send establishment datagram %d: %w", i, err)
 		}
+		c.attemptTXDatagrams++
 	}
 
 	if update.Material == nil {
@@ -779,8 +819,11 @@ func (c *SessionController) applyUpdateLocked(
 		return fmt.Errorf("submit activation transport: %w", err)
 	}
 
+	c.emitSessionEventLocked(SessionEventEstablished, now)
 	c.attempt = nil
 	c.attemptStartedAt = time.Time{}
+	c.attemptTXDatagrams = 0
+	c.attemptRXCandidates = 0
 	installedAt, ok := c.core.peer.currentInstalledAt()
 	if !ok {
 		return fmt.Errorf("installed current session is missing: %w", dataplane.ErrInvalidConfig)
@@ -864,8 +907,11 @@ func (c *SessionController) scheduleNextEstablishmentActionLocked(now time.Time)
 }
 
 func (c *SessionController) abandonEstablishmentLocked(now time.Time) {
+	c.emitSessionEventLocked(SessionEventEstablishmentAbandoned, now)
 	c.attempt = nil
 	c.attemptStartedAt = time.Time{}
+	c.attemptTXDatagrams = 0
+	c.attemptRXCandidates = 0
 	c.nextAction = time.Time{}
 	c.clearKeepaliveLocked()
 
@@ -892,6 +938,22 @@ func (c *SessionController) abandonEstablishmentLocked(now time.Time) {
 	if c.keepaliveEnabledLocked() {
 		c.nextAction = now.Add(c.nextKeepaliveDelay())
 	}
+}
+
+func (c *SessionController) emitSessionEventLocked(kind SessionEventKind, now time.Time) {
+	if c.eventHandler == nil {
+		return
+	}
+	var duration time.Duration
+	if !c.attemptStartedAt.IsZero() && !now.Before(c.attemptStartedAt) {
+		duration = now.Sub(c.attemptStartedAt)
+	}
+	c.eventHandler(SessionEvent{
+		Kind:         kind,
+		Duration:     duration,
+		TXDatagrams:  c.attemptTXDatagrams,
+		RXCandidates: c.attemptRXCandidates,
+	})
 }
 
 func (c *SessionController) openUsableLocked() {

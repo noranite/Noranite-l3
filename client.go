@@ -87,6 +87,26 @@ type TransportFailure struct {
 	Err        error
 }
 
+// ClientEventKind identifies a sparse client lifecycle diagnostic event.
+type ClientEventKind uint8
+
+const (
+	ClientEventEstablishmentStarted ClientEventKind = iota + 1
+	ClientEventEstablished
+	ClientEventEstablishmentAbandoned
+)
+
+// ClientEvent reports establishment lifecycle progress without exposing
+// protocol packet contents. TXDatagrams counts establishment datagrams submitted
+// to the runtime; RXCandidates counts received datagrams classified as
+// establishment traffic while the attempt was active.
+type ClientEvent struct {
+	Kind         ClientEventKind
+	Duration     time.Duration
+	TXDatagrams  uint32
+	RXCandidates uint32
+}
+
 // Client is the portable embedded Opaque-L3 client. It owns its PacketDevice,
 // optional connected datagram transport, packet runtime and SessionController.
 //
@@ -98,6 +118,7 @@ type TransportFailure struct {
 type Client struct {
 	runtime    *embeddedRuntime
 	controller *coreclient.SessionController
+	events     chan ClientEvent
 
 	runMu   sync.Mutex
 	started bool
@@ -181,12 +202,37 @@ func NewClient(config ClientConfig, device PacketDevice, transport net.Conn) (*C
 		runtime.disposeConstructionFailure()
 		return nil, fmt.Errorf("create Session controller: %w", err)
 	}
+
+	events := make(chan ClientEvent, 16)
+	controller.SetEventHandler(func(event coreclient.SessionEvent) {
+		var kind ClientEventKind
+		switch event.Kind {
+		case coreclient.SessionEventEstablishmentStarted:
+			kind = ClientEventEstablishmentStarted
+		case coreclient.SessionEventEstablished:
+			kind = ClientEventEstablished
+		case coreclient.SessionEventEstablishmentAbandoned:
+			kind = ClientEventEstablishmentAbandoned
+		default:
+			return
+		}
+		select {
+		case events <- ClientEvent{
+			Kind:         kind,
+			Duration:     event.Duration,
+			TXDatagrams:  event.TXDatagrams,
+			RXCandidates: event.RXCandidates,
+		}:
+		default:
+		}
+	})
 	runtime.demux = controller
 	runtime.eventSink = controller
 
 	return &Client{
 		runtime:    runtime,
 		controller: controller,
+		events:     events,
 	}, nil
 }
 
@@ -306,6 +352,16 @@ func (c *Client) WaitReady(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+}
+
+// Events reports sparse best-effort client lifecycle diagnostics. The channel
+// is intentionally not closed and publication never blocks protocol progress.
+// A slow or absent consumer may miss events.
+func (c *Client) Events() <-chan ClientEvent {
+	if c == nil {
+		return nil
+	}
+	return c.events
 }
 
 // TransportFailures reports loss of the currently published outer transport.

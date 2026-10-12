@@ -101,7 +101,7 @@ new file mode 100644
 index 0000000..ddf75b6
 --- /dev/null
 +++ b/protocol/noranite/endpoint.go
-@@ -0,0 +1,561 @@
+@@ -0,0 +1,604 @@
 +//go:build with_noranite
 +
 +package noranite
@@ -310,6 +310,7 @@ index 0000000..ddf75b6
 +	e.lifecycleMu.Unlock()
 +
 +	go e.runClient(runCtx, cancel, client, runDone)
++	go e.runClientEvents(runCtx, client)
 +	go e.runTransportManager(runCtx, client, e.transportWake, transportDone)
 +	return nil
 +}
@@ -324,6 +325,31 @@ index 0000000..ddf75b6
 +		e.logger.Error("Noranite client stopped: ", err)
 +	}
 +	done <- err
++}
++
++func (e *Endpoint) runClientEvents(ctx context.Context, client *noraniteCore.Client) {
++	events := client.Events()
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case event := <-events:
++			switch event.Kind {
++			case noraniteCore.ClientEventEstablishmentStarted:
++				e.logger.Info("Noranite session establishment started")
++			case noraniteCore.ClientEventEstablished:
++				e.logger.Info(
++					"Noranite session established in ", event.Duration,
++					" (tx=", event.TXDatagrams, ", rx_candidates=", event.RXCandidates, ")",
++				)
++			case noraniteCore.ClientEventEstablishmentAbandoned:
++				e.logger.Warn(
++					"Noranite session establishment abandoned after ", event.Duration,
++					" (tx=", event.TXDatagrams, ", rx_candidates=", event.RXCandidates, ")",
++				)
++			}
++		}
++	}
 +}
 +
 +func (e *Endpoint) runTransportManager(
@@ -375,6 +401,8 @@ index 0000000..ddf75b6
 +			continue
 +		}
 +
++		dialStartedAt := time.Now()
++		e.logger.Debug("Noranite outer transport dial to ", e.serverEndpoint)
 +		transport, err := e.dialTransport(ctx)
 +		if err == nil {
 +			if ctx.Err() != nil {
@@ -390,6 +418,11 @@ index 0000000..ddf75b6
 +
 +			generation, replaceErr := client.ReplaceTransport(transport)
 +			if replaceErr == nil {
++				e.logger.Info(
++					"Noranite outer transport ready (generation ", generation,
++					", local ", transport.LocalAddr(), ", remote ", transport.RemoteAddr(),
++					", dial ", time.Since(dialStartedAt), ")",
++				)
 +				currentGeneration = generation
 +				needDial = false
 +				redialDelay = transportRedialDelayMin
@@ -405,7 +438,10 @@ index 0000000..ddf75b6
 +		if ctx.Err() != nil {
 +			return
 +		}
-+		e.logger.Warn("dial Noranite outer transport: ", err, "; retry in ", redialDelay)
++		e.logger.Warn(
++			"dial Noranite outer transport after ", time.Since(dialStartedAt),
++			": ", err, "; retry in ", redialDelay,
++		)
 +
 +		timer := time.NewTimer(redialDelay)
 +		select {
@@ -472,7 +508,14 @@ index 0000000..ddf75b6
 +
 +func (e *Endpoint) onPauseUpdated(event int) {
 +	switch event {
-+	case pause.EventDevicePaused, pause.EventNetworkPause, pause.EventDeviceWake, pause.EventNetworkWake:
++	case pause.EventDevicePaused:
++		e.logger.Debug("Noranite device paused")
++	case pause.EventNetworkPause:
++		e.logger.Debug("Noranite network paused")
++	case pause.EventDeviceWake:
++		e.logger.Debug("Noranite device resumed; outer transport refresh requested")
++	case pause.EventNetworkWake:
++		e.logger.Debug("Noranite network resumed; outer transport refresh requested")
 +	default:
 +		return
 +	}
@@ -663,3 +706,15 @@ index 0000000..ddf75b6
 +	}
 +	return key, nil
 +}
+diff --git a/cmd/internal/build_libbox/main.go b/cmd/internal/build_libbox/main.go
+--- a/cmd/internal/build_libbox/main.go
++++ b/cmd/internal/build_libbox/main.go
+@@ -62,7 +62,7 @@ func init() {
+ 	sharedFlags = append(sharedFlags, "-ldflags", "-X github.com/sagernet/sing-box/constant.Version="+currentTag+" -X internal/godebug.defaultGODEBUG=multipathtcp=0 -s -w -buildid=  -checklinkname=0")
+ 	debugFlags = append(debugFlags, "-ldflags", "-X github.com/sagernet/sing-box/constant.Version="+currentTag+" -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0")
+ 
+-	sharedTags = append(sharedTags, "with_gvisor", "with_quic", "with_wireguard", "with_utls", "with_naive_outbound", "with_clash_api", "badlinkname", "tfogo_checklinkname0")
++	sharedTags = append(sharedTags, "with_gvisor", "with_quic", "with_wireguard", "with_utls", "with_naive_outbound", "with_clash_api", "with_noranite", "badlinkname", "tfogo_checklinkname0")
+ 	darwinTags = append(darwinTags, "with_dhcp", "grpcnotrace")
+ 	// memcTags = append(memcTags, "with_tailscale")
+ 	sharedTags = append(sharedTags, "with_tailscale", "ts_omit_logtail", "ts_omit_ssh", "ts_omit_drive", "ts_omit_taildrop", "ts_omit_webclient", "ts_omit_doctor", "ts_omit_capture", "ts_omit_kube", "ts_omit_aws", "ts_omit_synology", "ts_omit_bird")
