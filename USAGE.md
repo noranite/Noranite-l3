@@ -136,29 +136,39 @@ On process restart, the server loads `server.peers` again, so the persistent fil
 
 To use Noranite as an endpoint in a full TUN/proxy client, build sing-box with the Noranite reference integration.
 
-The integration targets **sing-box v1.13.15** and is provided as a standalone patch:
+The current integration targets **sing-box v1.14.2** and is provided as a standalone patch:
 
 ```text
-integrations/sing-box/sing-box-1.13.15-noranite-integration.patch
+integrations/sing-box/sing-box-1.14.2-noranite-integration.patch
 ```
 
-### Build
+### Requirements
 
-1. Clone the sing-box source and check out `v1.13.15`:
+sing-box v1.14.2 requires **Go 1.25.5 or newer**. Its normal `make build` target sets `GOTOOLCHAIN=local`, so install/select a sufficiently new local Go toolchain before building; the automatic Go toolchain downloader is not used by that target.
+
+The Noranite integration requires `with_gvisor`. The standard sing-box v1.14.2 desktop build-tag sets already include it.
+
+Keep the Noranite-l3 checkout available locally while building sing-box. The integration is linked through a local Go module replacement; Noranite is not vendored into the sing-box patch.
+
+### Build a sing-box binary
+
+The order below is intentional: apply the integration first, then add the local Noranite module replacement, then run `go mod tidy`.
+
+1. Clone sing-box and check out exactly `v1.14.2`:
 
 ```bash
 git clone https://github.com/SagerNet/sing-box.git
 cd sing-box
-git checkout v1.13.15
+git checkout v1.14.2
 ```
 
-2. Apply the Noranite patch:
+2. Apply the Noranite integration patch:
 
 ```bash
-git apply /path/to/Noranite-l3/integrations/sing-box/sing-box-1.13.15-noranite-integration.patch
+git apply /path/to/Noranite-l3/integrations/sing-box/sing-box-1.14.2-noranite-integration.patch
 ```
 
-3. Point the sing-box module at your local Noranite-l3 checkout:
+3. Point the sing-box module at the local Noranite-l3 checkout and update module metadata:
 
 ```bash
 go mod edit \
@@ -168,28 +178,65 @@ go mod edit \
 go mod tidy
 ```
 
-4. Build sing-box using its normal build process, adding the `with_noranite` build tag.
+Do not run `go mod tidy` between adding the temporary Noranite requirement and applying the patch: before the patched source imports Noranite, `tidy` is free to remove an otherwise unused requirement.
 
-On Linux/macOS:
+4. Build the regular sing-box binary with the `with_noranite` tag.
+
+On Linux and macOS:
 
 ```bash
 TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS),with_noranite"
 make build TAGS="$TAGS"
 ```
 
-On Windows, use the build-tag set from:
+On Windows, start from the tags in:
 
 ```text
 release/DEFAULT_BUILD_TAGS_WINDOWS
 ```
 
-and add:
+and append `with_noranite` before invoking `make build`. For example, from PowerShell:
 
-```text
-with_noranite
+```powershell
+$tags = (Get-Content release/DEFAULT_BUILD_TAGS_WINDOWS -Raw).Trim() + ",with_noranite"
+make build TAGS="$tags"
 ```
 
-The integration requires `with_gvisor`; that tag is already included in the standard sing-box v1.13.15 build-tag sets.
+The resulting executable is the normal sing-box binary with an additional `noranite` endpoint type.
+
+### Build mobile libbox
+
+The v1.14.2 integration patch also adds `with_noranite` to sing-box's shared libbox build tags. For the patched tree, the normal libbox targets therefore include Noranite automatically; do not add a separate tag manually.
+
+Install the sing-box mobile build tools once if needed:
+
+```bash
+make lib_install
+```
+
+Build Android libbox:
+
+```bash
+make lib_android
+```
+
+Build the Apple libbox framework on macOS:
+
+```bash
+make lib_apple
+```
+
+The Apple target covers iOS/iOS Simulator, tvOS/tvOS Simulator, and macOS according to the sing-box v1.14.2 `build_libbox` configuration.
+
+### Integration behavior
+
+The endpoint implements sing-box's `FlowOutbound`/`tun.Port` path. Eligible IPv4 TCP, UDP, and ICMP traffic can therefore enter Noranite directly as L3 packet batches instead of being forced through the L4 gVisor path. The gVisor device remains available as the fallback path and is why `with_gvisor` is still required.
+
+Noranite's own embedded runtime is batch-aware on every platform. The outer UDP adapter uses sing's native connected-packet batching when the platform provides it (for example Linux/Android and Darwin-family systems) and falls back to ordinary connected `net.Conn` reads/writes otherwise. The fallback is part of the normal integration and does not require a platform-specific Noranite patch.
+
+The current Noranite protocol and sing-box endpoint are IPv4-only for both the tunnel address and the configured server address.
+
+### Configuration
 
 After building, a `noranite` endpoint becomes available in the configuration:
 
@@ -198,14 +245,16 @@ After building, a `noranite` endpoint becomes available in the configuration:
   "type": "noranite",
   "tag": "noranite",
   "server": "203.0.113.1",
-  "server_port": 443,
-  "address": "10.0.0.2",
+  "server_port": 41675,
+  "address": "10.66.0.2",
   "mtu": 1380,
   "route_key": "<base64>",
   "private_key": "<base64>",
   "server_public_key": "<base64>"
 }
 ```
+
+`server` and `address` must be IPv4 literals. `mtu` is optional; when omitted, the Noranite default is used. `persistent_keepalive_interval` is also optional and is expressed in seconds.
 
 The patch is a reference integration of Noranite with sing-box, not a separate sing-box distribution.
 

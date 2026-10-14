@@ -26,6 +26,11 @@ const (
 	// IPv4/UDP outer transport after worst-case Opaque-L3 DATA expansion.
 	MaxTunnelMTU = dataplane.MaxTunnelMTU
 
+	// PacketHeadroom is the writable prefix retained in embedded RX buffers
+	// before the decrypted inner IPv4 packet. L3 integrations may reuse it for
+	// platform/TUN framing while the packet is borrowed by PacketDevice.Write.
+	PacketHeadroom = dataplane.RouteSize
+
 	defaultGenerationLifetime = 24 * time.Hour
 	defaultReceiveGrace       = 5 * time.Second
 	defaultSoftRekeyAfter     = 12 * time.Hour
@@ -44,17 +49,41 @@ var (
 )
 
 // PacketDevice is the portable L3 packet boundary required by the embedded
-// client. Read and Write intentionally use the wireguard-go batch-shaped API,
-// but the embedded runtime always supplies exactly one buffer at a time.
+// client. Read and Write intentionally use the wireguard-go batch-shaped API.
 //
-// Read must place one inner IPv4 packet into bufs[0] starting at offset and set
-// sizes[0] to the packet length. Write receives one or more buffers whose inner
-// IPv4 packet begins at offset. The Client owns the device after NewClient
-// succeeds and closes it during shutdown.
+// Read may place up to len(bufs) inner IPv4 packets into the provided buffers,
+// each starting at offset, records their lengths in sizes, and returns the
+// packet count. Write receives one or more buffers whose inner IPv4 packet
+// begins at offset. The Client owns the device after NewClient succeeds and
+// closes it during shutdown.
 type PacketDevice interface {
 	Read(bufs [][]byte, sizes []int, offset int) (int, error)
 	Write(bufs [][]byte, offset int) (int, error)
 	Close() error
+}
+
+// BatchDatagramConn is an optional connected outer-datagram transport fast path.
+// Integrations that can receive or transmit several UDP datagrams per syscall may
+// implement it in addition to net.Conn. ReadBatch fills caller-owned buffers and
+// WriteBatch borrows packet slices only for the duration of the call.
+//
+// Client falls back to scalar net.Conn Read/Write when the transport does not
+// implement this interface.
+type BatchDatagramConn interface {
+	net.Conn
+	ReadBatch(bufs [][]byte, sizes []int) (int, error)
+	WriteBatch(packets [][]byte) error
+}
+
+// MaxWireDatagramSize returns the receive-buffer size required for a configured
+// inner MTU, including worst-case DATA expansion and generated establishment
+// packets. The caller is expected to pass a validated tunnel MTU.
+func MaxWireDatagramSize(mtu int) int {
+	size := mtu + dataplane.MaxDataExpansion
+	if size < dataplane.MaxGeneratedEstablishmentWirePacketSize {
+		size = dataplane.MaxGeneratedEstablishmentWirePacketSize
+	}
+	return size
 }
 
 // ClientConfig contains protocol identity, fixed peer addressing and optional
@@ -352,6 +381,28 @@ func (c *Client) WaitReady(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+}
+
+// WritePackets injects a batch of borrowed inner IPv4 packets directly into the
+// embedded client dataplane. The method copies accepted packets into Client-owned
+// buffers before returning, so callers may immediately reuse their input storage.
+// Run must be active concurrently; integrations normally call this from an L3
+// packet fast path after endpoint startup.
+func (c *Client) WritePackets(packets [][]byte) error {
+	if c == nil || c.runtime == nil || c.controller == nil {
+		return fmt.Errorf("opaque client is nil: %w", dataplane.ErrInvalidConfig)
+	}
+	if len(packets) == 0 {
+		return nil
+	}
+
+	c.runMu.Lock()
+	closed := c.closed
+	c.runMu.Unlock()
+	if closed {
+		return ErrClientClosed
+	}
+	return c.runtime.writePackets(packets)
 }
 
 // Events reports sparse best-effort client lifecycle diagnostics. The channel

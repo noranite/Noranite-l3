@@ -14,7 +14,10 @@ import (
 	"github.com/noranite/Noranite-l3/internal/dataplane"
 )
 
-const embeddedRuntimeBufferCount = 64
+const (
+	embeddedRuntimeBatchSize   = coreclient.DefaultEngineBatchSize
+	embeddedRuntimeBufferCount = embeddedRuntimeBatchSize * 4
+)
 
 var _ coreclient.SessionControllerRuntime = (*embeddedRuntime)(nil)
 
@@ -122,10 +125,7 @@ func newEmbeddedRuntime(
 		return nil, fmt.Errorf("create client ingress scratch: %w", err)
 	}
 
-	wireBufferSize := mtu + dataplane.MaxDataExpansion
-	if wireBufferSize < dataplane.MaxGeneratedEstablishmentWirePacketSize {
-		wireBufferSize = dataplane.MaxGeneratedEstablishmentWirePacketSize
-	}
+	wireBufferSize := MaxWireDatagramSize(mtu)
 
 	r := &embeddedRuntime{
 		device:            device,
@@ -135,7 +135,7 @@ func newEmbeddedRuntime(
 		admitScratch:      admitScratch,
 		txPool:            newPacketPool(wireBufferSize, embeddedRuntimeBufferCount),
 		rxPool:            newPacketPool(wireBufferSize, embeddedRuntimeBufferCount),
-		rxDeviceWrite:     make([][]byte, 0, 1),
+		rxDeviceWrite:     make([][]byte, 0, embeddedRuntimeBatchSize),
 		errC:              make(chan error, 1),
 		transportFailures: make(chan TransportFailure, 1),
 		ready:             make(chan struct{}),
@@ -160,7 +160,7 @@ func newEmbeddedRuntime(
 
 	txEngine, err := coreclient.NewOwnedTXEngine(
 		core,
-		coreclient.TXEngineConfig{BatchSize: 1},
+		coreclient.TXEngineConfig{BatchSize: embeddedRuntimeBatchSize},
 		r.writer.Send,
 		report,
 	)
@@ -171,7 +171,7 @@ func newEmbeddedRuntime(
 
 	rxEngine, err := coreclient.NewOwnedRXEngine(
 		core,
-		coreclient.RXEngineConfig{BatchSize: 1},
+		coreclient.RXEngineConfig{BatchSize: embeddedRuntimeBatchSize},
 		r.consumeRXResults,
 		report,
 	)
@@ -449,11 +449,149 @@ func (r *embeddedRuntime) Run() error {
 	return firstErr
 }
 
+func (r *embeddedRuntime) writePackets(packets [][]byte) error {
+	if r == nil {
+		return fmt.Errorf("embedded runtime is nil: %w", dataplane.ErrInvalidConfig)
+	}
+	if len(packets) == 0 {
+		return nil
+	}
+
+	select {
+	case <-r.ready:
+	case <-r.stop:
+		return ErrClientClosed
+	case <-r.done:
+		return ErrClientStopped
+	}
+
+	for len(packets) > 0 {
+		count := len(packets)
+		if count > embeddedRuntimeBatchSize {
+			count = embeddedRuntimeBatchSize
+		}
+		if err := r.submitBorrowedPacketBatch(packets[:count]); err != nil {
+			return err
+		}
+		packets = packets[count:]
+	}
+	return nil
+}
+
+func (r *embeddedRuntime) waitOutboundDemand() bool {
+	if r.eventSink == nil {
+		return true
+	}
+	demand := r.eventSink.HandleOutboundDemand()
+	select {
+	case <-demand.Usable:
+		return true
+	case <-demand.Abandoned:
+		return false
+	case <-r.stop:
+		return false
+	}
+}
+
+func (r *embeddedRuntime) admitInnerBuffer(
+	buffer []byte,
+	size int,
+	submission *coreclient.TXOwnedSubmission,
+) (bool, error) {
+	if size <= 0 || size > r.mtu {
+		return false, nil
+	}
+	inner := buffer[dataplane.RouteSize : dataplane.RouteSize+size]
+
+	for {
+		// Preserve SessionController demand semantics for every application DATA
+		// packet. Even while the current Session is TX-eligible this call may
+		// start a demand-driven soft rekey. If admission races a hard deadline,
+		// retry the same packet after another demand check.
+		if r.eventSink != nil && !r.waitOutboundDemand() {
+			return false, nil
+		}
+
+		err := r.core.AdmitInnerPacketInto(&submission.Operation, inner, cap(buffer))
+		if err == nil {
+			submission.Buffer = buffer[:0]
+			return true, nil
+		}
+		if r.eventSink != nil &&
+			(errors.Is(err, coreclient.ErrNoCurrentSession) || errors.Is(err, coreclient.ErrSessionNotTXEligible)) {
+			continue
+		}
+		if errors.Is(err, dataplane.ErrSequenceExhausted) ||
+			errors.Is(err, dataplane.ErrBufferTooSmall) ||
+			errors.Is(err, dataplane.ErrInvalidConfig) {
+			return false, fmt.Errorf("admit embedded packet: %w", err)
+		}
+		return false, nil
+	}
+}
+
+func (r *embeddedRuntime) submitBorrowedPacketBatch(packets [][]byte) error {
+	submissions := make([]coreclient.TXOwnedSubmission, 0, len(packets))
+	release := func() {
+		for i := range submissions {
+			r.txPool.Put(submissions[i].Buffer)
+			submissions[i] = coreclient.TXOwnedSubmission{}
+		}
+	}
+
+	for _, packet := range packets {
+		if len(packet) <= 0 || len(packet) > r.mtu {
+			continue
+		}
+
+		buffer := r.txPool.Get()
+		copy(buffer[dataplane.RouteSize:dataplane.RouteSize+len(packet)], packet)
+		var submission coreclient.TXOwnedSubmission
+		admitted, err := r.admitInnerBuffer(buffer, len(packet), &submission)
+		if err != nil {
+			r.txPool.Put(buffer)
+			release()
+			return err
+		}
+		if !admitted {
+			r.txPool.Put(buffer)
+			continue
+		}
+		submissions = append(submissions, submission)
+	}
+
+	if len(submissions) == 0 {
+		return nil
+	}
+	if err := r.txEngine.EnqueueOwnedBatch(submissions, r.txPool); err != nil {
+		release()
+		return fmt.Errorf("enqueue embedded direct TX batch: %w", err)
+	}
+	if r.eventSink != nil {
+		for range submissions {
+			r.eventSink.HandleOutboundActivity()
+		}
+	}
+	clear(submissions)
+	return nil
+}
+
 func (r *embeddedRuntime) runDeviceIngress() error {
-	buffer := r.txPool.Get()
-	bufs := [][]byte{buffer}
-	sizes := []int{0}
-	submissions := make([]coreclient.TXOwnedSubmission, 1)
+	bufs := make([][]byte, embeddedRuntimeBatchSize)
+	sizes := make([]int, embeddedRuntimeBatchSize)
+	for i := range bufs {
+		bufs[i] = r.txPool.Get()
+	}
+	defer func() {
+		for _, buffer := range bufs {
+			if buffer != nil {
+				r.txPool.Put(buffer)
+			}
+		}
+	}()
+
+	indices := make([]int, embeddedRuntimeBatchSize)
+	submissions := make([]coreclient.TXOwnedSubmission, embeddedRuntimeBatchSize)
 
 	for {
 		n, err := r.device.Read(bufs, sizes, dataplane.RouteSize)
@@ -463,82 +601,76 @@ func (r *embeddedRuntime) runDeviceIngress() error {
 		if n <= 0 {
 			continue
 		}
-		if n != 1 {
-			return fmt.Errorf("embedded packet device returned batch size %d, want 1: %w", n, dataplane.ErrInvalidConfig)
+		if n > len(bufs) {
+			return fmt.Errorf("embedded packet device returned batch size %d, max %d: %w", n, len(bufs), dataplane.ErrInvalidConfig)
 		}
 
-		size := sizes[0]
-		if size <= 0 || size > r.mtu {
-			continue
-		}
-
-		inner := buffer[dataplane.RouteSize : dataplane.RouteSize+size]
-		submission := &submissions[0]
-		admitted := false
-		abandoned := false
-
-		for {
-			if r.eventSink != nil {
-				demand := r.eventSink.HandleOutboundDemand()
-				select {
-				case <-demand.Usable:
-				case <-demand.Abandoned:
-					abandoned = true
-				case <-r.stop:
-					return nil
+		accepted := 0
+		for i := 0; i < n; i++ {
+			submission := &submissions[accepted]
+			admitted, err := r.admitInnerBuffer(bufs[i], sizes[i], submission)
+			if err != nil {
+				for j := 0; j < accepted; j++ {
+					submissions[j] = coreclient.TXOwnedSubmission{}
 				}
-				if abandoned {
-					break
-				}
+				return err
 			}
-
-			err := r.core.AdmitInnerPacketInto(&submission.Operation, inner, cap(buffer))
-			if err == nil {
-				admitted = true
-				break
-			}
-			if r.eventSink != nil &&
-				(errors.Is(err, coreclient.ErrNoCurrentSession) || errors.Is(err, coreclient.ErrSessionNotTXEligible)) {
-				// The Session may have crossed its hard deadline between the demand
-				// check and admission. Keep this one packet and establish a fresh one.
+			if !admitted {
 				continue
 			}
-			if errors.Is(err, dataplane.ErrSequenceExhausted) ||
-				errors.Is(err, dataplane.ErrBufferTooSmall) ||
-				errors.Is(err, dataplane.ErrInvalidConfig) {
-				return fmt.Errorf("admit embedded device packet: %w", err)
-			}
-			break
+			indices[accepted] = i
+			accepted++
 		}
-		if abandoned || !admitted {
+
+		if accepted == 0 {
+			select {
+			case <-r.stop:
+				return nil
+			default:
+			}
 			continue
 		}
-		submission.Buffer = buffer[:0]
 
-		if err := r.txEngine.EnqueueOwnedBatch(submissions, r.txPool); err != nil {
-			return fmt.Errorf("enqueue embedded device TX: %w", err)
+		if err := r.txEngine.EnqueueOwnedBatch(submissions[:accepted], r.txPool); err != nil {
+			for i := 0; i < accepted; i++ {
+				submissions[i] = coreclient.TXOwnedSubmission{}
+			}
+			return fmt.Errorf("enqueue embedded device TX batch: %w", err)
 		}
 		if r.eventSink != nil {
-			r.eventSink.HandleOutboundActivity()
+			for i := 0; i < accepted; i++ {
+				r.eventSink.HandleOutboundActivity()
+			}
 		}
-		*submission = coreclient.TXOwnedSubmission{}
 
-		buffer = r.txPool.Get()
-		bufs[0] = buffer
+		for i := 0; i < accepted; i++ {
+			submissions[i] = coreclient.TXOwnedSubmission{}
+			bufs[indices[i]] = nil
+		}
+		for i := 0; i < accepted; i++ {
+			bufs[indices[i]] = r.txPool.Get()
+		}
 	}
 }
 
 func (r *embeddedRuntime) runTransportGeneration(generation *embeddedTransportGeneration) error {
-	buffer := r.rxPool.Get()
+	buffers := make([][]byte, embeddedRuntimeBatchSize)
+	sizes := make([]int, embeddedRuntimeBatchSize)
+	indices := make([]int, embeddedRuntimeBatchSize)
+	submissions := make([]coreclient.RXOwnedSubmission, embeddedRuntimeBatchSize)
+	for i := range buffers {
+		buffers[i] = r.rxPool.Get()
+	}
 	defer func() {
-		if buffer != nil {
-			r.rxPool.Put(buffer)
+		for _, buffer := range buffers {
+			if buffer != nil {
+				r.rxPool.Put(buffer)
+			}
 		}
 	}()
-	submissions := make([]coreclient.RXOwnedSubmission, 1)
 
 	for {
-		n, err := generation.conn.Read(buffer)
+		count, err := readDatagramBatch(generation.conn, buffers, sizes)
 		if err != nil {
 			// Socket/read failure is a recoverable transport event. If this is
 			// still the current generation, make transport unavailable; if a
@@ -546,10 +678,13 @@ func (r *embeddedRuntime) runTransportGeneration(generation *embeddedTransportGe
 			r.invalidateTransport(generation, fmt.Errorf("read embedded UDP transport: %w", err))
 			return nil
 		}
-		receivedAt := time.Now()
-		if n <= 0 || n > len(buffer) {
+		if count <= 0 {
 			continue
 		}
+		if count > len(buffers) || count > len(sizes) {
+			return fmt.Errorf("embedded UDP transport returned batch size %d, max %d: %w", count, len(buffers), dataplane.ErrInvalidConfig)
+		}
+		receivedAt := time.Now()
 
 		r.transportProcessMu.Lock()
 		r.transportMu.Lock()
@@ -560,53 +695,87 @@ func (r *embeddedRuntime) runTransportGeneration(generation *embeddedTransportGe
 			continue
 		}
 
-		packet := buffer[:n]
-		route, routeErr := dataplane.DecodeRoute(r.admitScratch, packet)
-		routeDecoded := routeErr == nil
-
-		if r.demux != nil {
-			handled, err := r.demux.HandleDatagram(
-				r.serverEndpoint,
-				route,
-				routeDecoded,
-				packet,
-			)
-			if err != nil {
-				r.transportProcessMu.Unlock()
-				return fmt.Errorf("embedded UDP control-plane demux: %w", err)
-			}
-			if handled {
-				r.transportProcessMu.Unlock()
+		accepted := 0
+		for i := 0; i < count; i++ {
+			size := sizes[i]
+			buffer := buffers[i]
+			if buffer == nil || size <= 0 || size > len(buffer) {
 				continue
 			}
+
+			packet := buffer[:size]
+			route, routeErr := dataplane.DecodeRoute(r.admitScratch, packet)
+			routeDecoded := routeErr == nil
+
+			if r.demux != nil {
+				handled, err := r.demux.HandleDatagram(
+					r.serverEndpoint,
+					route,
+					routeDecoded,
+					packet,
+				)
+				if err != nil {
+					r.transportProcessMu.Unlock()
+					return fmt.Errorf("embedded UDP control-plane demux: %w", err)
+				}
+				if handled {
+					continue
+				}
+			}
+			if !routeDecoded {
+				continue
+			}
+
+			submission := &submissions[accepted]
+			if err := r.core.AdmitNetworkDatagramRouteAtInto(
+				&submission.Operation,
+				route,
+				r.serverEndpoint,
+				packet,
+				receivedAt,
+			); err != nil {
+				continue
+			}
+			indices[accepted] = i
+			accepted++
 		}
-		if !routeDecoded {
+
+		if accepted == 0 {
 			r.transportProcessMu.Unlock()
 			continue
 		}
-
-		submission := &submissions[0]
-		if err := r.core.AdmitNetworkDatagramRouteAtInto(
-			&submission.Operation,
-			route,
-			r.serverEndpoint,
-			packet,
-			receivedAt,
-		); err != nil {
+		if err := r.rxEngine.EnqueueOwnedBatch(submissions[:accepted], r.rxPool); err != nil {
+			for i := 0; i < accepted; i++ {
+				submissions[i] = coreclient.RXOwnedSubmission{}
+			}
 			r.transportProcessMu.Unlock()
-			continue
+			return fmt.Errorf("enqueue embedded UDP RX batch: %w", err)
 		}
-
-		if err := r.rxEngine.EnqueueOwnedBatch(submissions, r.rxPool); err != nil {
-			r.transportProcessMu.Unlock()
-			return fmt.Errorf("enqueue embedded UDP RX: %w", err)
+		for i := 0; i < accepted; i++ {
+			submissions[i] = coreclient.RXOwnedSubmission{}
+			buffers[indices[i]] = nil // ownership transferred to RX engine/pool
 		}
-		*submission = coreclient.RXOwnedSubmission{}
-		buffer = nil // ownership transferred to RX engine/pool
 		r.transportProcessMu.Unlock()
 
-		buffer = r.rxPool.Get()
+		for i := 0; i < accepted; i++ {
+			buffers[indices[i]] = r.rxPool.Get()
+		}
 	}
+}
+
+func readDatagramBatch(conn net.Conn, buffers [][]byte, sizes []int) (int, error) {
+	if len(buffers) == 0 || len(sizes) < len(buffers) {
+		return 0, fmt.Errorf("invalid embedded UDP batch buffers: %w", dataplane.ErrInvalidConfig)
+	}
+	if batchConn, ok := conn.(BatchDatagramConn); ok {
+		return batchConn.ReadBatch(buffers, sizes)
+	}
+	n, err := conn.Read(buffers[0])
+	if err != nil {
+		return 0, err
+	}
+	sizes[0] = n
+	return 1, nil
 }
 
 func (r *embeddedRuntime) consumeRXResults(results []coreclient.RXResult) error {
@@ -664,10 +833,18 @@ func (w *connectedDatagramWriter) Send(packets []coreclient.TXPacket) error {
 	if len(packets) == 0 {
 		return nil
 	}
-	if len(packets) != 1 {
-		return fmt.Errorf("embedded TX batch size %d, want 1: %w", len(packets), dataplane.ErrInvalidConfig)
+	wireBatch := make([][]byte, len(packets))
+	for i := range packets {
+		packet := &packets[i]
+		if len(packet.Wire) == 0 {
+			return fmt.Errorf("invalid connected datagram write: %w", dataplane.ErrInvalidConfig)
+		}
+		if normalizeServerEndpoint(packet.Destination) != w.serverEndpoint {
+			return fmt.Errorf("unexpected embedded UDP destination %v, want %v: %w", packet.Destination, w.serverEndpoint, dataplane.ErrInvalidConfig)
+		}
+		wireBatch[i] = packet.Wire
 	}
-	return w.WriteDatagram(packets[0].Wire, packets[0].Destination)
+	return w.writeBatch(wireBatch)
 }
 
 func (w *connectedDatagramWriter) WriteDatagram(packet []byte, destination netip.AddrPort) error {
@@ -677,6 +854,13 @@ func (w *connectedDatagramWriter) WriteDatagram(packet []byte, destination netip
 	if normalizeServerEndpoint(destination) != w.serverEndpoint {
 		return fmt.Errorf("unexpected embedded UDP destination %v, want %v: %w", destination, w.serverEndpoint, dataplane.ErrInvalidConfig)
 	}
+	return w.writeBatch([][]byte{packet})
+}
+
+func (w *connectedDatagramWriter) writeBatch(packets [][]byte) error {
+	if w == nil || w.runtime == nil || len(packets) == 0 {
+		return fmt.Errorf("invalid connected datagram batch write: %w", dataplane.ErrInvalidConfig)
+	}
 
 	r := w.runtime
 	r.transportMu.Lock()
@@ -684,30 +868,38 @@ func (w *connectedDatagramWriter) WriteDatagram(packet []byte, destination netip
 	closing := r.transportClosing
 	r.transportMu.Unlock()
 	if closing || generation == nil {
-		// No transport is a recoverable network state. The admitted packet is
+		// No transport is a recoverable network state. Admitted ciphertext is
 		// intentionally dropped and must never be retransmitted with the same
 		// traffic sequence/ciphertext.
 		return nil
 	}
-	n, err := generation.conn.Write(packet)
-	if err == nil && n == len(packet) {
+
+	var err error
+	if batchConn, ok := generation.conn.(BatchDatagramConn); ok {
+		err = batchConn.WriteBatch(packets)
+	} else {
+		for _, packet := range packets {
+			var n int
+			n, err = generation.conn.Write(packet)
+			if err != nil || n != len(packet) {
+				if err == nil {
+					err = io.ErrShortWrite
+				}
+				break
+			}
+		}
+	}
+	if err == nil {
 		return nil
 	}
 
-	// A connected UDP send failure is recoverable transport loss, not a
-	// protocol failure. Invalidate only if this generation is still current; a
-	// concurrent replacement makes this write result stale.
-	if err != nil {
-		// EMSGSIZE is a packet/path-MTU failure, not evidence that the connected
-		// UDP socket is dead. The admitted ciphertext is still single-use and is
-		// dropped, but the transport remains current.
-		if errors.Is(err, syscall.EMSGSIZE) {
-			return nil
-		}
-		r.invalidateTransport(generation, fmt.Errorf("write embedded UDP transport: %w", err))
-	} else {
-		r.invalidateTransport(generation, fmt.Errorf("write embedded UDP transport: %w", io.ErrShortWrite))
+	// EMSGSIZE is a packet/path-MTU failure, not evidence that the connected
+	// UDP socket is dead. The admitted ciphertext is still single-use and is
+	// dropped, but the transport remains current.
+	if errors.Is(err, syscall.EMSGSIZE) {
+		return nil
 	}
+	r.invalidateTransport(generation, fmt.Errorf("write embedded UDP transport: %w", err))
 	return nil
 }
 

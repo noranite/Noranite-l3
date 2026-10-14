@@ -537,6 +537,84 @@ func (d *shortWritePacketDevice) Write(_ [][]byte, _ int) (int, error) {
 	return 0, nil
 }
 
+type testActivityEventSink struct {
+	demandCalls int
+	usable      chan struct{}
+	abandoned   chan struct{}
+}
+
+func newTestActivityEventSink() *testActivityEventSink {
+	usable := make(chan struct{})
+	close(usable)
+	return &testActivityEventSink{
+		usable:    usable,
+		abandoned: make(chan struct{}),
+	}
+}
+
+func (s *testActivityEventSink) HandleOutboundDemand() coreclient.OutboundDemandWait {
+	s.demandCalls++
+	return coreclient.OutboundDemandWait{
+		Usable:    s.usable,
+		Abandoned: s.abandoned,
+	}
+}
+
+func (s *testActivityEventSink) HandleOutboundActivity() {}
+
+func TestEmbeddedRuntimeChecksOutboundDemandBeforeEligibleAdmission(t *testing.T) {
+	clientIP := netip.MustParseAddr("10.66.0.2")
+	serverIP := netip.MustParseAddr("10.66.0.1")
+	serverEndpoint := netip.MustParseAddrPort("192.0.2.1:41675")
+	var routeKey, c2s, s2c [32]byte
+	for i := range routeKey {
+		routeKey[i] = byte(i + 1)
+		c2s[i] = byte(0x41 + i)
+		s2c[i] = byte(0x81 + i)
+	}
+	clientSession, err := dataplane.NewSession(0x10, c2s, s2c, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	core, err := coreclient.New(coreclient.Config{
+		RouteKey:           routeKey,
+		TunnelIPv4:         clientIP,
+		ServerEndpoint:     serverEndpoint,
+		MaxInnerPacketSize: DefaultMTU,
+		Lifecycle: coreclient.LifecycleConfig{
+			GenerationLifetime: 24 * time.Hour,
+			ReceiveGrace:       5 * time.Second,
+		},
+		Session: clientSession,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sink := newTestActivityEventSink()
+	runtime := &embeddedRuntime{
+		core:      core,
+		mtu:       DefaultMTU,
+		eventSink: sink,
+		stop:      make(chan struct{}),
+	}
+	packet := testIPv4Packet(clientIP, serverIP, 96)
+	buffer := make([]byte, MaxWireDatagramSize(DefaultMTU))
+	copy(buffer[dataplane.RouteSize:], packet)
+
+	var submission coreclient.TXOwnedSubmission
+	admitted, err := runtime.admitInnerBuffer(buffer, len(packet), &submission)
+	if err != nil {
+		t.Fatalf("admitInnerBuffer: %v", err)
+	}
+	if !admitted {
+		t.Fatal("eligible packet was not admitted")
+	}
+	if sink.demandCalls != 1 {
+		t.Fatalf("HandleOutboundDemand calls=%d, want 1", sink.demandCalls)
+	}
+}
+
 func TestEmbeddedRuntimeStartsWithoutInitialTransport(t *testing.T) {
 	clientIP := netip.MustParseAddr("10.66.0.2")
 	serverEndpoint := netip.MustParseAddrPort("192.0.2.1:41675")
@@ -1369,6 +1447,96 @@ func TestClientReplaceTransportDuringEstablishment(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("server loop did not stop")
 	}
+}
+
+func TestReadDatagramBatchUsesBatchTransport(t *testing.T) {
+	conn := &testBatchDatagramConn{
+		readPackets: [][]byte{
+			{1, 2, 3},
+			{4, 5},
+		},
+	}
+	buffers := [][]byte{make([]byte, 8), make([]byte, 8), make([]byte, 8)}
+	sizes := make([]int, len(buffers))
+
+	count, err := readDatagramBatch(conn, buffers, sizes)
+	if err != nil {
+		t.Fatalf("readDatagramBatch: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("readDatagramBatch count=%d, want 2", count)
+	}
+	if !bytes.Equal(buffers[0][:sizes[0]], []byte{1, 2, 3}) {
+		t.Fatalf("first packet=%v", buffers[0][:sizes[0]])
+	}
+	if !bytes.Equal(buffers[1][:sizes[1]], []byte{4, 5}) {
+		t.Fatalf("second packet=%v", buffers[1][:sizes[1]])
+	}
+	if conn.readBatchCalls != 1 {
+		t.Fatalf("ReadBatch calls=%d, want 1", conn.readBatchCalls)
+	}
+}
+
+func TestConnectedDatagramWriterUsesBatchTransport(t *testing.T) {
+	serverEndpoint := netip.MustParseAddrPort("192.0.2.1:41675")
+	conn := &testBatchDatagramConn{}
+	runtime := &embeddedRuntime{
+		transport: &embeddedTransportGeneration{id: 1, conn: conn},
+	}
+	writer := &connectedDatagramWriter{
+		runtime:        runtime,
+		serverEndpoint: serverEndpoint,
+	}
+
+	packets := []coreclient.TXPacket{
+		{Wire: []byte{1, 2, 3}, Destination: serverEndpoint},
+		{Wire: []byte{4, 5}, Destination: serverEndpoint},
+	}
+	if err := writer.Send(packets); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if conn.writeBatchCalls != 1 {
+		t.Fatalf("WriteBatch calls=%d, want 1", conn.writeBatchCalls)
+	}
+	if len(conn.writtenPackets) != len(packets) {
+		t.Fatalf("written packet count=%d, want %d", len(conn.writtenPackets), len(packets))
+	}
+	for i := range packets {
+		if !bytes.Equal(conn.writtenPackets[i], packets[i].Wire) {
+			t.Fatalf("written packet %d=%v, want %v", i, conn.writtenPackets[i], packets[i].Wire)
+		}
+	}
+}
+
+type testBatchDatagramConn struct {
+	net.Conn
+	readPackets     [][]byte
+	writtenPackets  [][]byte
+	readBatchCalls  int
+	writeBatchCalls int
+}
+
+func (c *testBatchDatagramConn) ReadBatch(buffers [][]byte, sizes []int) (int, error) {
+	c.readBatchCalls++
+	if len(c.readPackets) > len(buffers) || len(c.readPackets) > len(sizes) {
+		return 0, io.ErrShortBuffer
+	}
+	for i, packet := range c.readPackets {
+		if len(packet) > len(buffers[i]) {
+			return 0, io.ErrShortBuffer
+		}
+		sizes[i] = copy(buffers[i], packet)
+	}
+	return len(c.readPackets), nil
+}
+
+func (c *testBatchDatagramConn) WriteBatch(packets [][]byte) error {
+	c.writeBatchCalls++
+	c.writtenPackets = c.writtenPackets[:0]
+	for _, packet := range packets {
+		c.writtenPackets = append(c.writtenPackets, append([]byte(nil), packet...))
+	}
+	return nil
 }
 
 type blockingWriteConn struct {

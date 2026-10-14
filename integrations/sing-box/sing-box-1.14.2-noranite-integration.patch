@@ -1,16 +1,15 @@
 diff --git a/constant/proxy.go b/constant/proxy.go
-index 278a46c..e228b66 100644
 --- a/constant/proxy.go
 +++ b/constant/proxy.go
-@@ -15,6 +15,7 @@ const (
- 	TypeTrojan       = "trojan"
- 	TypeNaive        = "naive"
- 	TypeWireGuard    = "wireguard"
-+	TypeNoranite     = "noranite"
- 	TypeHysteria     = "hysteria"
- 	TypeTor          = "tor"
- 	TypeSSH          = "ssh"
-@@ -68,6 +69,8 @@ func ProxyDisplayName(proxyType string) string {
+@@ -17,6 +17,7 @@
+ 	TypeTrojan             = "trojan"
+ 	TypeNaive              = "naive"
+ 	TypeWireGuard          = "wireguard"
++	TypeNoranite           = "noranite"
+ 	TypeHysteria           = "hysteria"
+ 	TypeTor                = "tor"
+ 	TypeSSH                = "ssh"
+@@ -84,6 +85,8 @@
  		return "Naive"
  	case TypeWireGuard:
  		return "WireGuard"
@@ -19,9 +18,31 @@ index 278a46c..e228b66 100644
  	case TypeHysteria:
  		return "Hysteria"
  	case TypeTor:
+diff --git a/include/registry.go b/include/registry.go
+--- a/include/registry.go
++++ b/include/registry.go
+@@ -111,6 +111,7 @@
+ 	registry := endpoint.NewRegistry()
+ 
+ 	registerWireGuardEndpoint(registry)
++	registerNoraniteEndpoint(registry)
+ 	registerOpenConnectEndpoint(registry)
+ 	registerOpenVPNEndpoints(registry)
+ 	registerTailscaleEndpoint(registry)
+diff --git a/cmd/internal/build_libbox/main.go b/cmd/internal/build_libbox/main.go
+--- a/cmd/internal/build_libbox/main.go
++++ b/cmd/internal/build_libbox/main.go
+@@ -63,7 +63,7 @@
+ 	sharedFlags = append(sharedFlags, "-ldflags", build_shared.LinkerFlags(currentTag, false))
+ 	debugFlags = append(debugFlags, "-ldflags", build_shared.LinkerFlags(currentTag, true))
+ 
+-	sharedTags = append(sharedTags, "with_gvisor", "with_quic", "with_wireguard", "with_utls", "with_naive_outbound", "with_clash_api", "with_usbip", "with_openvpn", "with_openconnect", "badlinkname", "tfogo_checklinkname0")
++	sharedTags = append(sharedTags, "with_gvisor", "with_quic", "with_wireguard", "with_utls", "with_naive_outbound", "with_clash_api", "with_usbip", "with_openvpn", "with_openconnect", "with_noranite", "badlinkname", "tfogo_checklinkname0")
+ 	darwinTags = append(darwinTags, "with_dhcp", "grpcnotrace")
+ 	// memcTags = append(memcTags, "with_tailscale")
+ 	sharedTags = append(sharedTags, "with_tailscale", "ts_omit_logtail", "ts_omit_ssh", "ts_omit_drive", "ts_omit_taildrop", "ts_omit_webclient", "ts_omit_doctor", "ts_omit_capture", "ts_omit_kube", "ts_omit_aws", "ts_omit_synology", "ts_omit_bird")
 diff --git a/include/noranite.go b/include/noranite.go
 new file mode 100644
-index 0000000..aca7b32
 --- /dev/null
 +++ b/include/noranite.go
 @@ -0,0 +1,12 @@
@@ -39,7 +60,6 @@ index 0000000..aca7b32
 +}
 diff --git a/include/noranite_stub.go b/include/noranite_stub.go
 new file mode 100644
-index 0000000..6aa2c7e
 --- /dev/null
 +++ b/include/noranite_stub.go
 @@ -0,0 +1,20 @@
@@ -63,21 +83,8 @@ index 0000000..6aa2c7e
 +		return nil, E.New(`Noranite is not included in this build, rebuild with -tags with_noranite`)
 +	})
 +}
-diff --git a/include/registry.go b/include/registry.go
-index f090845..d37bb35 100644
---- a/include/registry.go
-+++ b/include/registry.go
-@@ -101,6 +101,7 @@ func EndpointRegistry() *endpoint.Registry {
- 	registry := endpoint.NewRegistry()
- 
- 	registerWireGuardEndpoint(registry)
-+	registerNoraniteEndpoint(registry)
- 	registerTailscaleEndpoint(registry)
- 
- 	return registry
 diff --git a/option/noranite.go b/option/noranite.go
 new file mode 100644
-index 0000000..0dffff2
 --- /dev/null
 +++ b/option/noranite.go
 @@ -0,0 +1,15 @@
@@ -98,10 +105,9 @@ index 0000000..0dffff2
 +}
 diff --git a/protocol/noranite/endpoint.go b/protocol/noranite/endpoint.go
 new file mode 100644
-index 0000000..ddf75b6
 --- /dev/null
 +++ b/protocol/noranite/endpoint.go
-@@ -0,0 +1,618 @@
+@@ -0,0 +1,818 @@
 +//go:build with_noranite
 +
 +package noranite
@@ -110,8 +116,10 @@ index 0000000..ddf75b6
 +	"context"
 +	"encoding/base64"
 +	"errors"
++	"io"
 +	"net"
 +	"net/netip"
++	"os"
 +	"sync"
 +	"sync/atomic"
 +	"time"
@@ -126,6 +134,7 @@ index 0000000..ddf75b6
 +	"github.com/sagernet/sing-box/option"
 +	"github.com/sagernet/sing-box/transport/wireguard"
 +	"github.com/sagernet/sing-tun"
++	"github.com/sagernet/sing/common/buf"
 +	"github.com/sagernet/sing/common/bufio"
 +	E "github.com/sagernet/sing/common/exceptions"
 +	"github.com/sagernet/sing/common/logger"
@@ -143,6 +152,7 @@ index 0000000..ddf75b6
 +
 +var (
 +	_ adapter.Endpoint                   = (*Endpoint)(nil)
++	_ adapter.FlowOutbound               = (*Endpoint)(nil)
 +	_ adapter.InterfaceUpdateListener    = (*Endpoint)(nil)
 +	_ dialer.PacketDialerWithDestination = (*Endpoint)(nil)
 +)
@@ -177,12 +187,13 @@ index 0000000..ddf75b6
 +	transportDone chan struct{}
 +	pauseCallback *list.Element[pause.Callback]
 +
-+	started atomic.Bool
++	returnState atomic.Pointer[returnPathState]
++	started     atomic.Bool
 +}
 +
 +func NewEndpoint(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options option.NoraniteEndpointOptions) (adapter.Endpoint, error) {
 +	if !tun.WithGVisor {
-+		return nil, E.New("Noranite requires gVisor support, rebuild with -tags with_gvisor")
++		return nil, E.New("Noranite requires gVisor support for the L4 fallback path, rebuild with -tags with_gvisor")
 +	}
 +
 +	server := options.Server.Unmap()
@@ -231,7 +242,7 @@ index 0000000..ddf75b6
 +		Adapter: endpoint.NewAdapterWithDialerOptions(
 +			C.TypeNoranite,
 +			tag,
-+			[]string{N.NetworkTCP, N.NetworkUDP},
++			[]string{N.NetworkTCP, N.NetworkUDP, N.NetworkICMP},
 +			options.DialerOptions,
 +		),
 +		ctx:                 ctx,
@@ -272,7 +283,11 @@ index 0000000..ddf75b6
 +	if err != nil {
 +		e.lifecycleMu.Unlock()
 +		cancel()
-+		return E.Cause(err, "create Noranite gVisor device")
++		return E.Cause(err, "create Noranite gVisor fallback device")
++	}
++	returnDevice := &returnDeviceWrapper{
++		Device: device,
++		state:  &e.returnState,
 +	}
 +
 +	// Outer UDP acquisition is recoverable rather than demand-lazy. The transport
@@ -286,7 +301,7 @@ index 0000000..ddf75b6
 +		StaticPrivateKey:    e.privateKey,
 +		ServerPublicKey:     e.serverPublicKey,
 +		PersistentKeepalive: e.persistentKeepalive,
-+	}, device, nil)
++	}, returnDevice, nil)
 +	if err != nil {
 +		e.lifecycleMu.Unlock()
 +		_ = device.Close()
@@ -303,9 +318,6 @@ index 0000000..ddf75b6
 +	e.started.Store(true)
 +	runDone := e.runDone
 +	if e.pauseManager != nil {
-+		// Pinned pause.Manager registration only links the callback; our callback
-+		// never takes lifecycleMu, so registering here avoids a startup lost-wake
-+		// window without introducing a lock cycle.
 +		e.pauseCallback = e.pauseManager.RegisterCallback(e.onPauseUpdated)
 +	}
 +	e.lifecycleMu.Unlock()
@@ -379,9 +391,6 @@ index 0000000..ddf75b6
 +				needDial = true
 +				redialDelay = transportRedialDelayMin
 +			case <-wake:
-+				// pause/wake is analogous to WireGuard Down/Up. If the old tracked
-+				// socket was already closed by ResetNetwork, TransportFailure reaches
-+				// the same path; otherwise replace it after the host becomes active.
 +				needDial = true
 +				redialDelay = transportRedialDelayMin
 +			}
@@ -391,9 +400,6 @@ index 0000000..ddf75b6
 +		if !e.waitTransportActive(ctx, wake) {
 +			return
 +		}
-+		// A wake that released the pause wait is already accounted for. Drop the
-+		// coalesced token before dialing so it cannot force an immediate duplicate
-+		// replacement after success. A new pause is checked again below.
 +		select {
 +		case <-wake:
 +		default:
@@ -411,8 +417,6 @@ index 0000000..ddf75b6
 +				return
 +			}
 +			if e.pauseManager != nil && e.pauseManager.IsPaused() {
-+				// Pause raced the dial. Do not publish a socket acquired while the
-+				// host path is being suspended or has no default network.
 +				_ = transport.Close()
 +				continue
 +			}
@@ -465,10 +469,6 @@ index 0000000..ddf75b6
 +}
 +
 +func (e *Endpoint) waitTransportActive(ctx context.Context, wake <-chan struct{}) bool {
-+	// WireGuard ClientBind uses pause.Manager.WaitActive(). That method observes
-+	// the manager/root context, while Endpoint.Close cancels this worker's runCtx
-+	// and waits for it. Use the same pause state with callback wake so shutdown
-+	// remains locally cancellable.
 +	for e.pauseManager != nil && e.pauseManager.IsPaused() {
 +		select {
 +		case <-ctx.Done():
@@ -500,15 +500,103 @@ index 0000000..ddf75b6
 +}
 +
 +func (e *Endpoint) dialTransport(ctx context.Context) (net.Conn, error) {
-+	return e.outboundDialer.DialContext(
++	conn, err := e.outboundDialer.DialContext(
 +		ctx,
 +		N.NetworkUDP,
 +		M.SocksaddrFrom(e.serverEndpoint.Addr(), e.serverEndpoint.Port()),
 +	)
++	if err != nil {
++		return nil, err
++	}
++	return newNoraniteBatchConn(conn, e.mtu), nil
 +}
 +
-+func (e *Endpoint) InterfaceUpdated() {
-+	if !e.started.Load() {
++type noraniteBatchConn struct {
++	net.Conn
++	packetConn N.NetPacketConn
++	reader     N.ConnectedPacketBatchReadWaiter
++	writer     N.ConnectedPacketBatchWriter
++}
++
++var _ noraniteCore.BatchDatagramConn = (*noraniteBatchConn)(nil)
++
++func newNoraniteBatchConn(conn net.Conn, mtu int) net.Conn {
++	packetConn := bufio.NewUnbindPacketConn(conn)
++	reader, hasReader := bufio.CreateConnectedPacketBatchReadWaiter(packetConn)
++	writer, hasWriter := bufio.CreateConnectedPacketBatchWriter(packetConn)
++	if !hasReader && !hasWriter {
++		return conn
++	}
++	if hasReader {
++		reader.InitializeReadWaiter(N.ReadWaitOptions{
++			MTU:       noraniteCore.MaxWireDatagramSize(mtu),
++			BatchSize: bufio.DefaultPacketReadBatchSize,
++		})
++	}
++	return &noraniteBatchConn{
++		Conn:       conn,
++		packetConn: packetConn,
++		reader:     reader,
++		writer:     writer,
++	}
++}
++
++func (c *noraniteBatchConn) ReadBatch(packets [][]byte, sizes []int) (int, error) {
++	if len(packets) == 0 || len(sizes) < len(packets) {
++		return 0, os.ErrInvalid
++	}
++	if c.reader == nil {
++		n, err := c.Conn.Read(packets[0])
++		if err != nil {
++			return 0, err
++		}
++		sizes[0] = n
++		return 1, nil
++	}
++
++	buffers, _, err := c.reader.WaitReadConnectedPackets()
++	if err != nil {
++		return 0, err
++	}
++	defer buf.ReleaseMulti(buffers)
++	if len(buffers) > len(packets) {
++		return 0, E.New("Noranite transport batch size ", len(buffers), " exceeds caller capacity ", len(packets))
++	}
++	for i, buffer := range buffers {
++		if buffer.Len() > len(packets[i]) {
++			return 0, io.ErrShortBuffer
++		}
++		sizes[i] = copy(packets[i], buffer.Bytes())
++	}
++	return len(buffers), nil
++}
++
++func (c *noraniteBatchConn) WriteBatch(packets [][]byte) error {
++	if len(packets) == 0 {
++		return nil
++	}
++	if c.writer == nil {
++		for _, packet := range packets {
++			n, err := c.Conn.Write(packet)
++			if err != nil {
++				return err
++			}
++			if n != len(packet) {
++				return io.ErrShortWrite
++			}
++		}
++		return nil
++	}
++
++	buffers := make([]*buf.Buffer, len(packets))
++	for i, packet := range packets {
++		buffers[i] = buf.As(packet)
++	}
++	return c.writer.WriteConnectedPacketBatch(buffers)
++}
++
++func (e *Endpoint) InterfaceUpdated(ctx context.Context) {
++	if ctx.Err() != nil || !e.started.Load() {
 +		return
 +	}
 +
@@ -538,6 +626,124 @@ index 0000000..ddf75b6
 +	case e.transportWake <- struct{}{}:
 +	default:
 +	}
++}
++
++func (e *Endpoint) PreMatchFlow(_ string, destination netip.Addr) adapter.PreMatchAction {
++	destination = destination.Unmap()
++	if !destination.IsValid() || !destination.Is4() {
++		return adapter.PreMatchContinue
++	}
++	return adapter.PreMatchFlow
++}
++
++func (e *Endpoint) PortAddresses() (netip.Addr, netip.Addr) {
++	return e.tunnelIPv4, netip.Addr{}
++}
++
++func (e *Endpoint) PortMTU() uint32 {
++	return uint32(e.mtu)
++}
++
++func (e *Endpoint) AttachReturn(returnPath tun.Return) error {
++	headroom := returnPath.ReturnHeadroom()
++	if headroom > noraniteCore.PacketHeadroom {
++		return E.New("return path headroom ", headroom, " exceeds available ", noraniteCore.PacketHeadroom)
++	}
++	newState := &returnPathState{
++		returnPath: returnPath,
++		headroom:   headroom,
++	}
++	for {
++		currentState := e.returnState.Load()
++		if currentState != nil {
++			if currentState.returnPath == returnPath {
++				return nil
++			}
++			return E.New("return path already attached")
++		}
++		if e.returnState.CompareAndSwap(nil, newState) {
++			return nil
++		}
++	}
++}
++
++func (e *Endpoint) DetachReturn(returnPath tun.Return) error {
++	currentState := e.returnState.Load()
++	if currentState != nil && currentState.returnPath == returnPath {
++		e.returnState.CompareAndSwap(currentState, nil)
++	}
++	return nil
++}
++
++func (e *Endpoint) WritePackets(packets [][]byte) error {
++	if len(packets) == 0 {
++		return nil
++	}
++	if !e.started.Load() {
++		return E.New("Noranite is not ready yet")
++	}
++
++	e.lifecycleMu.Lock()
++	client := e.client
++	e.lifecycleMu.Unlock()
++	if client == nil {
++		return E.New("Noranite is not ready yet")
++	}
++	return client.WritePackets(packets)
++}
++
++type returnPathState struct {
++	returnPath tun.Return
++	headroom   int
++}
++
++type returnDeviceWrapper struct {
++	wireguard.Device
++	state *atomic.Pointer[returnPathState]
++}
++
++func (d *returnDeviceWrapper) Write(bufs [][]byte, offset int) (int, error) {
++	if d.state == nil {
++		return d.Device.Write(bufs, offset)
++	}
++	state := d.state.Load()
++	if state == nil || len(bufs) == 0 {
++		return d.Device.Write(bufs, offset)
++	}
++	if state.headroom > offset {
++		return 0, E.New("Noranite return headroom ", state.headroom, " exceeds packet offset ", offset)
++	}
++
++	packets := make([][]byte, len(bufs))
++	for i, packet := range bufs {
++		if offset > len(packet) {
++			return 0, E.New("Noranite return packet is shorter than offset")
++		}
++		packets[i] = packet[offset-state.headroom:]
++	}
++	unconsumed := state.returnPath.ReturnPackets(packets)
++	if len(unconsumed) == 0 {
++		return len(bufs), nil
++	}
++	if len(unconsumed) == len(bufs) {
++		return d.Device.Write(bufs, offset)
++	}
++
++	remaining := make([][]byte, 0, len(unconsumed))
++	searchIndex := 0
++	for _, packet := range unconsumed {
++		for searchIndex < len(bufs) && &packet[0] != &bufs[searchIndex][offset-state.headroom] {
++			searchIndex++
++		}
++		if searchIndex == len(bufs) {
++			return len(bufs) - len(unconsumed), E.New("Noranite return path returned an unknown packet")
++		}
++		remaining = append(remaining, bufs[searchIndex])
++		searchIndex++
++	}
++
++	written, err := d.Device.Write(remaining, offset)
++	return len(bufs) - len(remaining) + written, err
 +}
 +
 +func (e *Endpoint) Close() error {
@@ -720,15 +926,3 @@ index 0000000..ddf75b6
 +	}
 +	return key, nil
 +}
-diff --git a/cmd/internal/build_libbox/main.go b/cmd/internal/build_libbox/main.go
---- a/cmd/internal/build_libbox/main.go
-+++ b/cmd/internal/build_libbox/main.go
-@@ -62,7 +62,7 @@ func init() {
- 	sharedFlags = append(sharedFlags, "-ldflags", "-X github.com/sagernet/sing-box/constant.Version="+currentTag+" -X internal/godebug.defaultGODEBUG=multipathtcp=0 -s -w -buildid=  -checklinkname=0")
- 	debugFlags = append(debugFlags, "-ldflags", "-X github.com/sagernet/sing-box/constant.Version="+currentTag+" -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0")
- 
--	sharedTags = append(sharedTags, "with_gvisor", "with_quic", "with_wireguard", "with_utls", "with_naive_outbound", "with_clash_api", "badlinkname", "tfogo_checklinkname0")
-+	sharedTags = append(sharedTags, "with_gvisor", "with_quic", "with_wireguard", "with_utls", "with_naive_outbound", "with_clash_api", "with_noranite", "badlinkname", "tfogo_checklinkname0")
- 	darwinTags = append(darwinTags, "with_dhcp", "grpcnotrace")
- 	// memcTags = append(memcTags, "with_tailscale")
- 	sharedTags = append(sharedTags, "with_tailscale", "ts_omit_logtail", "ts_omit_ssh", "ts_omit_drive", "ts_omit_taildrop", "ts_omit_webclient", "ts_omit_doctor", "ts_omit_capture", "ts_omit_kube", "ts_omit_aws", "ts_omit_synology", "ts_omit_bird")
